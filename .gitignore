@@ -1,0 +1,28 @@
+# Model checkpoints
+*.pt
+
+# Generated synthetic data
+generated/
+synthetic_data/
+
+# Raw dataset
+hybrid_rnns_pytorch/data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+*.log
