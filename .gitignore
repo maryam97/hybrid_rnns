@@ -26,3 +26,6 @@ build/
 # Environment
 .env
 *.log
+
+# vscode
+.vscode/
