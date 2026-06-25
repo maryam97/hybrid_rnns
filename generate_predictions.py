@@ -56,7 +56,7 @@ def parse_args():
                    help='Explicit seed list (overrides --n-seeds / --first-seed).')
     p.add_argument('--no-debug',    action='store_true',
                    help='Use all participants (default: first 20 for a quick check).')
-    p.add_argument('--save-dir',    type=str, default='generated',
+    p.add_argument('--save-dir',    type=str, default='synthetic_data',
                    help='Output directory (created if needed).')
     p.add_argument('--prefix',      type=str, default=None,
                    help='Filename prefix.  Default: checkpoint name without extension.')

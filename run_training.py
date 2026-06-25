@@ -22,6 +22,7 @@ Usage
 """
 
 import argparse
+import torch
 from hybrid_rnns_pytorch.fit_hyb_rnn import train
 from hybrid_rnns_pytorch.rnn_config import get_config
 
@@ -36,6 +37,9 @@ def parse_args():
                         help='Path to dataset CSV (overrides config default).')
     parser.add_argument('--lr', type=float, default=None,
                         help='Learning rate (overrides config default).')
+    parser.add_argument('--save', action='store_true',
+                        help='Whether to save the trained model weights.')
+                            
     return parser.parse_args()
 
 
@@ -59,6 +63,10 @@ def main():
 
     scalars, model = train(config)
     print(f'\nTraining complete. Final scalars: {scalars}')
+    if args.save:
+        save_path = f'trained_models/{args.model}_e={scalars["step"]}_pred.pt'
+        torch.save(model.state_dict(), save_path)
+        print(f'Weights saved to {save_path}')
 
 
 if __name__ == '__main__':

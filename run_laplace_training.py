@@ -174,7 +174,7 @@ def main():
     if best_model_dict is not None:
         wrapped.load_state_dict(best_model_dict)
 
-    save_path = args.save or f'{args.model}_marglik_s={args.seed}_be={args.backend}_e={n_epochs}.pt'
+    save_path = args.save or f'trained_models/{args.model}_marglik_be={args.backend}_e={n_epochs}.pt'
     torch.save(model.state_dict(), save_path)
     print(f'Weights saved to {save_path}')
 
