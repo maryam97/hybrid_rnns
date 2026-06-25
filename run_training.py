@@ -22,6 +22,9 @@ Usage
 """
 
 import argparse
+import json
+import os
+import time
 import torch
 from hybrid_rnns_pytorch.fit_hyb_rnn import train
 from hybrid_rnns_pytorch.rnn_config import get_config
@@ -61,8 +64,26 @@ def main():
     print(f'Config: model={config.model_name}, debug={config.debug}, '
           f'steps={config.n_training_steps}, lr={config.learning_rate}')
 
+    t0 = time.time()
     scalars, model = train(config)
+    elapsed = time.time() - t0
     print(f'\nTraining complete. Final scalars: {scalars}')
+    print(f'Training time: {elapsed:.1f}s ({elapsed/60:.1f} min)')
+
+    results = {
+        'model':           config.model_name,
+        'steps':           config.n_training_steps,
+        'lr':              config.learning_rate,
+        'debug':           config.debug,
+        'training_time_s': round(elapsed, 1),
+        **scalars,
+    }
+    os.makedirs('results', exist_ok=True)
+    results_path = f'results/{config.model_name}_s={scalars["step"]}.json'
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f'Results saved to {results_path}')
+
     if args.save:
         save_path = f'trained_models/{args.model}_e={scalars["step"]}_pred.pt'
         torch.save(model.state_dict(), save_path)

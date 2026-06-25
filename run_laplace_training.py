@@ -25,6 +25,9 @@ nn.Linear (ASDL limitation). For BiRNN the two scalar nn.Parameters
 """
 
 import argparse
+import json
+import os
+import time
 import torch
 import pandas as pd
 
@@ -152,6 +155,7 @@ def main():
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())}')
 
     # ---- marginal-likelihood training ----
+    t0 = time.time()
     best_model_dict, best_precision, best_marglik = marglik_optimization(
         model             = wrapped,
         train_loader      = train_loader,
@@ -166,9 +170,29 @@ def main():
         backend           = backend_cls,
     )
 
+    elapsed = time.time() - t0
     print(f'\n=== Done ===')
+    print(f'Training time  : {elapsed:.1f}s ({elapsed/60:.1f} min)')
     print(f'Best marglik : {best_marglik:.4f}')
     print(f'Prior precision: {best_precision}')
+
+    results = {
+        'model':           args.model,
+        'backend':         args.backend,
+        'prior_structure': prior_struct,
+        'epochs':          n_epochs,
+        'lr':              args.lr,
+        'lr_hyp':          args.lr_hyp,
+        'seed':            args.seed,
+        'best_marglik':    round(best_marglik, 4),
+        'best_precision':  best_precision.tolist() if best_precision is not None else None,
+        'training_time_s': round(elapsed, 1),
+    }
+    os.makedirs('results', exist_ok=True)
+    results_path = f'results/{args.model}_marglik_be={args.backend}_e={n_epochs}.json'
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f'Results saved to {results_path}')
 
     # Restore best weights
     if best_model_dict is not None:
