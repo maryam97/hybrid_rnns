@@ -12,6 +12,7 @@ nn.Linear (ASDL's Kron factoring does not support nn.RNN modules).
 """
 
 from copy import deepcopy
+import time
 
 import numpy as np
 import torch
@@ -127,7 +128,7 @@ def marglik_optimization(
         optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr)
         optimizer.train()
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
 
     # ---- hyperparameter optimiser ----
     hyper_optimizer = torch.optim.Adam([log_prior_prec], lr=lr_hyp)
@@ -138,7 +139,12 @@ def marglik_optimization(
     losses   = []
     margliks = []
 
+    t_total = time.perf_counter()
+
     for epoch in range(1, n_epochs + 1):
+        t_epoch = time.perf_counter()
+
+        # ---- training pass ----
         model.train()
         if _HAS_SCHEDULEFREE:
             optimizer.train()
@@ -159,6 +165,8 @@ def marglik_optimization(
 
             epoch_loss += loss.detach().cpu().item() / len(train_loader)
 
+        t_train = time.perf_counter()
+
         # ---- eval-mode metrics -------------------------------------------------
         # For schedulefree Adam, training-mode params are the momentum interpolant
         # ("x"), not the true iterate ("z"). optimizer.eval() switches to "z" so
@@ -178,11 +186,16 @@ def marglik_optimization(
                 n_correct += (torch.argmax(f_v, dim=-1) == y_v).sum().item()
                 n_valid   += mask.sum().item()
 
+        t_eval = time.perf_counter()
+
         paper_acc  = np.exp(-nll_sum / n_valid)
         argmax_acc = n_correct / n_valid
         losses.append(epoch_loss)
-        print(f'MARGLIK[epoch={epoch}]: loss={losses[-1]:.3f}  '
-              f'acc={paper_acc:.4f}  argmax_acc={argmax_acc:.4f}',
+        elapsed_total = t_eval - t_total
+        print(f'MARGLIK[epoch={epoch}/{n_epochs}]: '
+              f'loss={losses[-1]:.3f}  acc={paper_acc:.4f}  argmax_acc={argmax_acc:.4f}  '
+              f'| train={t_train-t_epoch:.1f}s  eval={t_eval-t_train:.1f}s  '
+              f'total={elapsed_total:.0f}s ({elapsed_total/60:.1f}min)',
               flush=True)
 
         # ---- marglik hyperparameter update ----
@@ -193,6 +206,8 @@ def marglik_optimization(
             if _HAS_SCHEDULEFREE:
                 optimizer.train()
             continue
+
+        t_marglik_start = time.perf_counter()
 
         # Do NOT pass prior_precision to the constructor: KronLLLaplace.fit()
         # reasserts self.prior_precision before kron._H is built, so any tensor
@@ -209,15 +224,20 @@ def marglik_optimization(
             hyper_optimizer.step()
             margliks.append(marglik.item())
 
+        t_marglik_end = time.perf_counter()
+
         if margliks[-1] < best_marglik:
             best_model_dict = deepcopy(model.state_dict())
             best_precision  = deepcopy(prior_prec.detach())
             best_marglik    = margliks[-1]
-            print(f'MARGLIK[epoch={epoch}]: marglik={best_marglik:.2f}  '
-                  f'[new best — saving]', flush=True)
+            print(f'MARGLIK[epoch={epoch}/{n_epochs}]: marglik={best_marglik:.2f}  '
+                  f'[new best — saving]  hessian+hyp={t_marglik_end-t_marglik_start:.1f}s',
+                  flush=True)
         else:
-            print(f'MARGLIK[epoch={epoch}]: marglik={margliks[-1]:.2f}  '
-                  f'[no improvement over {best_marglik:.2f}]', flush=True)
+            print(f'MARGLIK[epoch={epoch}/{n_epochs}]: marglik={margliks[-1]:.2f}  '
+                  f'[no improvement over {best_marglik:.2f}]  '
+                  f'hessian+hyp={t_marglik_end-t_marglik_start:.1f}s',
+                  flush=True)
 
         # restore training mode for next epoch
         model.train()

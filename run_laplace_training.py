@@ -78,6 +78,9 @@ def parse_args():
                         '"layerwise" for full. '
                         '"layerwise" gives one prior precision per parameter tensor '
                         '(10 for BiRNN) and is the recommended setting with --backend full.')
+    p.add_argument('--hidden-size',   type=int, default=64,
+                   help='Hidden units per RNN layer (default: 64, paper-optimal). '
+                        'Must match the checkpoint if loading one.')
     return p.parse_args()
 
 
@@ -93,9 +96,12 @@ def main():
     config             = get_config()
     config.model_name  = args.model
     config.dataset_path = args.dataset
-    # ASDL's Kron factoring supports nn.Linear but not nn.RNN — disable the
-    # fast-path so all recurrent ops go through Linear layers.
+    config.network_params.hidden_size = args.hidden_size
     config.network_params.use_rnn_cell = False
+    # Weight decay is NOT applied here: the Laplace prior precision already acts
+    # as L2 regularization and is optimised via marginal likelihood. Adding
+    # AdamW weight decay on top would double-regularise.
+    config.weight_decay = 0.0
 
     debug    = not args.no_debug
     n_epochs = args.epochs or (10 if debug else 500)
@@ -116,6 +122,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device          : {device}')
     print(f'Model           : {config.model_name}')
+    print(f'Hidden size     : {config.network_params.hidden_size}')
     print(f'Epochs          : {n_epochs}  (burnin: {burnin})')
     print(f'LR              : {args.lr}  lr_hyp: {args.lr_hyp}')
     print(f'Backend         : {args.backend}  ({laplace_cls.__name__}+{backend_cls.__name__})')
@@ -178,6 +185,7 @@ def main():
 
     results = {
         'model':           args.model,
+        'hidden_size':     args.hidden_size,
         'backend':         args.backend,
         'prior_structure': prior_struct,
         'epochs':          n_epochs,

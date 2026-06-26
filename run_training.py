@@ -39,10 +39,17 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default=None,
                         help='Path to dataset CSV (overrides config default).')
     parser.add_argument('--lr', type=float, default=None,
-                        help='Learning rate (overrides config default).')
-    parser.add_argument('--save', action='store_true', 
+                        help='Learning rate (default: 1e-3, paper-optimal).')
+    parser.add_argument('--hidden-size', type=int, default=None,
+                        help='Hidden units per RNN layer (default: 64, paper-optimal).')
+    parser.add_argument('--weight-decay', type=float, default=None,
+                        help='AdamW weight decay (default: 1e-4, paper-optimal).')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Training batch size (default: 32).')
+    parser.add_argument('--steps', type=int, default=None,
+                        help='Number of training steps (default: 1M).')
+    parser.add_argument('--save', action='store_true',
                         help='Whether to save the trained model weights.')
-                            
     return parser.parse_args()
 
 
@@ -60,9 +67,20 @@ def main():
         config.dataset_path = args.dataset
     if args.lr is not None:
         config.learning_rate = args.lr
-    print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}')
-    print(f'Config: model={config.model_name}, debug={config.debug}, '
-          f'steps={config.n_training_steps}, lr={config.learning_rate}')
+    if args.hidden_size is not None:
+        config.network_params.hidden_size = args.hidden_size
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.steps is not None:
+        config.n_training_steps = args.steps
+
+    print(f'Device      : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}')
+    print(f'Model       : {config.model_name}')
+    print(f'Hidden size : {config.network_params.hidden_size}')
+    print(f'LR          : {config.learning_rate}  weight_decay: {config.weight_decay}')
+    print(f'Batch size  : {config.batch_size}  steps: {config.n_training_steps}')
 
     t0 = time.time()
     scalars, model = train(config)
@@ -72,14 +90,17 @@ def main():
 
     results = {
         'model':           config.model_name,
+        'hidden_size':     config.network_params.hidden_size,
         'steps':           config.n_training_steps,
         'lr':              config.learning_rate,
+        'weight_decay':    config.weight_decay,
+        'batch_size':      config.batch_size,
         'debug':           config.debug,
         'training_time_s': round(elapsed, 1),
         **scalars,
     }
     os.makedirs('results', exist_ok=True)
-    results_path = f'results/{config.model_name}_s={scalars["step"]}.json'
+    results_path = f'results/{config.model_name}_hs={config.network_params.hidden_size}_s={scalars["step"]}.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {results_path}')

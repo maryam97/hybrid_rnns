@@ -10,7 +10,7 @@ import torch.nn.functional as F
 @dataclass
 class NetworkParams:
     n_actions:            int    = 4
-    hidden_size:          int    = 16
+    hidden_size:          int    = 64
     final_activation_fn:  object = field(
         default_factory=lambda: (lambda x: F.softmax(x, dim=-1))
     )
@@ -64,7 +64,7 @@ class Config:
     debug: bool = True
 
     random_seed:  int = 42
-    dataset_path: str = 'hybrid_rnns_pytorch/data/openSourceRawDataset_v2.csv' #smallExampleDataset
+    dataset_path: str = 'hybrid_rnns_pytorch/data/openSourceRawDataset.csv' #smallExampleDataset
 
     n_trials:   int = 150
     n_datasets: int = 3520 + 388
@@ -75,8 +75,8 @@ class Config:
     n_training_steps: int = field(init=False)
     batch_size:       int = field(init=False)
 
-    learning_rate: float = 1e-4
-    weight_decay:  float = 1e-5
+    learning_rate: float = 1e-3
+    weight_decay:  float = 1e-4
 
     network_params: NetworkParams = field(default_factory=NetworkParams)
     rnn_rl_params:  RLParams      = field(default_factory=RLParams)
