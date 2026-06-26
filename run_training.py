@@ -40,7 +40,7 @@ def parse_args():
                         help='Path to dataset CSV (overrides config default).')
     parser.add_argument('--lr', type=float, default=None,
                         help='Learning rate (overrides config default).')
-    parser.add_argument('--save', action='store_true',
+    parser.add_argument('--save', action='store_true', 
                         help='Whether to save the trained model weights.')
                             
     return parser.parse_args()
@@ -60,7 +60,7 @@ def main():
         config.dataset_path = args.dataset
     if args.lr is not None:
         config.learning_rate = args.lr
-
+    print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}')
     print(f'Config: model={config.model_name}, debug={config.debug}, '
           f'steps={config.n_training_steps}, lr={config.learning_rate}')
 
@@ -85,6 +85,7 @@ def main():
     print(f'Results saved to {results_path}')
 
     if args.save:
+        os.makedirs('trained_models', exist_ok=True)
         save_path = f'trained_models/{args.model}_e={scalars["step"]}_pred.pt'
         torch.save(model.state_dict(), save_path)
         print(f'Weights saved to {save_path}')
