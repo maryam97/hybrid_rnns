@@ -75,8 +75,8 @@ class Config:
     n_training_steps: int = field(init=False)
     batch_size:       int = field(init=False)
 
-    learning_rate: float = 1e-3
-    weight_decay:  float = 1e-4
+    learning_rate: float = 1e-4
+    weight_decay:  float = 1e-5
 
     network_params: NetworkParams = field(default_factory=NetworkParams)
     rnn_rl_params:  RLParams      = field(default_factory=RLParams)
