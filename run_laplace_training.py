@@ -49,7 +49,7 @@ def parse_args():
     p.add_argument('--no-debug',     action='store_true')
     p.add_argument('--epochs',       type=int, default=None,
                    help='Training epochs (default: 10 debug / 500 full).')
-    p.add_argument('--lr',           type=float, default=1e-3)
+    p.add_argument('--lr',           type=float, default=1e-4)
     p.add_argument('--lr-hyp',       type=float, default=1e-1,
                    help='Learning rate for prior precision hyperparameter.')
     p.add_argument('--batch-size',   type=int,   default=32)
