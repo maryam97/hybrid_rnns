@@ -191,11 +191,12 @@ def marglik_optimization(
         paper_acc  = np.exp(-nll_sum / n_valid)
         argmax_acc = n_correct / n_valid
         losses.append(epoch_loss)
-        elapsed_total = t_eval - t_total
+        epoch_secs   = t_eval - t_epoch
+        elapsed_secs = t_eval - t_total
         print(f'MARGLIK[epoch={epoch}/{n_epochs}]: '
               f'loss={losses[-1]:.3f}  acc={paper_acc:.4f}  argmax_acc={argmax_acc:.4f}  '
-              f'| train={t_train-t_epoch:.1f}s  eval={t_eval-t_train:.1f}s  '
-              f'total={elapsed_total:.0f}s ({elapsed_total/60:.1f}min)',
+              f'| train={t_train-t_epoch:.1f}s  eval={t_eval-t_train:.1f}s  epoch={epoch_secs:.1f}s  '
+              f'elapsed={elapsed_secs:.0f}s ({elapsed_secs/60:.1f}min)',
               flush=True)
 
         # ---- marglik hyperparameter update ----
