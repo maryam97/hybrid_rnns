@@ -92,3 +92,42 @@ class Config:
 
 def get_config() -> Config:
     return Config()
+
+
+def get_rnn_config() -> Config:
+    """Vanilla RNN config from the paper (Table 1).
+
+    Confirmed by parameter count: hidden_size=64 + s=True → 4,740 params exactly.
+    Without s=True the model has only 644 params and performs much worse.
+    Paper also uses batch_size=64 (not 32) for the RNN.
+    """
+    config = Config()
+    config.model_name = 'rnn'
+    config.network_params.hidden_size = 64
+    config.rnn_rl_params.s = True   # hidden-state feedback — REQUIRED for 4,740 params
+    config.rnn_rl_params.o = False
+    return config
+
+
+def get_birnn_config() -> Config:
+    """Winning hybRNN config from the paper (notebook Example 2).
+
+    Key differences from the generic default:
+      s=True          — hidden state fed back as input to both RNNs
+      zero_values=True — value update replaces (not adds to) chosen arm
+      w_v=1, w_h=1   — both streams contribute with full weight
+      fit_forget=True — forgetting factor is learned
+      hidden_size=16  — paper default (JAX code)
+    """
+    config = Config()
+    config.model_name = 'birnn'
+    config.network_params.hidden_size = 16
+    config.rnn_rl_params.w_v          = 1.0
+    config.rnn_rl_params.w_h          = 1.0
+    config.rnn_rl_params.fit_forget   = True
+    config.rnn_rl_params.o            = False
+    config.rnn_rl_params.s            = True
+    config.rnn_rl_params.zero_values  = True
+    config.rnn_rl_params.fit_init_v   = True
+    config.rnn_rl_params.fit_init_h   = True
+    return config

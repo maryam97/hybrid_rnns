@@ -27,25 +27,27 @@ import os
 import time
 import torch
 from hybrid_rnns_pytorch.fit_hyb_rnn import train
-from hybrid_rnns_pytorch.rnn_config import get_config
+from hybrid_rnns_pytorch.rnn_config import get_config, get_rnn_config, get_birnn_config
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a hybrid RNN reward-learning model.')
     parser.add_argument('--model', choices=['cogmod', 'rnn', 'birnn'], default=None,
-                        help='Model to train (overrides config default).')
+                        help='Model to train. "birnn" uses the paper-optimal config '
+                             '(s=True, zero_values=True, w_v=1, w_h=1, fit_forget=True, '
+                             'hidden_size=16) unless overridden by other flags.')
     parser.add_argument('--no-debug', action='store_true',
                         help='Run full training (1M steps, batch=32) instead of debug mode.')
     parser.add_argument('--dataset', type=str, default=None,
                         help='Path to dataset CSV (overrides config default).')
     parser.add_argument('--lr', type=float, default=None,
-                        help='Learning rate (default: 1e-3, paper-optimal).')
+                        help='Learning rate (default: 1e-4).')
     parser.add_argument('--hidden-size', type=int, default=None,
-                        help='Hidden units per RNN layer (default: 64, paper-optimal).')
+                        help='Hidden units per RNN layer. Default: 16 for birnn, 64 for rnn.')
     parser.add_argument('--weight-decay', type=float, default=None,
-                        help='AdamW weight decay (default: 1e-4, paper-optimal).')
+                        help='AdamW weight decay (default: 1e-5).')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='Training batch size (default: 32).')
+                        help='Training batch size. Default: 64 for rnn, 32 for birnn (paper values).')
     parser.add_argument('--steps', type=int, default=None,
                         help='Number of training steps (default: 1M).')
     parser.add_argument('--save', action='store_true',
@@ -55,14 +57,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = get_config()
 
-    if args.model is not None:
-        config.model_name = args.model
+    # Use paper-verified configs by default; CLI flags override on top
+    if args.model == 'birnn':
+        config = get_birnn_config()
+    elif args.model == 'rnn':
+        config = get_rnn_config()
+    else:
+        config = get_config()
+        if args.model is not None:
+            config.model_name = args.model
     if args.no_debug:
         config.debug = False
         config.n_training_steps = int(1e6)
-        config.batch_size = 32
+        # paper batch sizes: rnn=64, birnn=32
+        config.batch_size = 64 if args.model == 'rnn' else 32
     if args.dataset is not None:
         config.dataset_path = args.dataset
     if args.lr is not None:
@@ -81,6 +90,10 @@ def main():
     print(f'Hidden size : {config.network_params.hidden_size}')
     print(f'LR          : {config.learning_rate}  weight_decay: {config.weight_decay}')
     print(f'Batch size  : {config.batch_size}  steps: {config.n_training_steps}')
+    if config.model_name == 'birnn':
+        p = config.rnn_rl_params
+        print(f'BiRNN params: s={p.s}  zero_values={p.zero_values}  '
+              f'w_v={p.w_v}  w_h={p.w_h}  fit_forget={p.fit_forget}')
 
     t0 = time.time()
     scalars, model = train(config)
