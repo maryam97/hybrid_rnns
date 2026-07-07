@@ -52,6 +52,10 @@ def parse_args():
                         help='Number of training steps (default: 1M).')
     parser.add_argument('--save', action='store_true',
                         help='Whether to save the trained model weights.')
+    parser.add_argument('--compile', action='store_true',
+                        help='torch.compile() the model.unroll() method to reduce '
+                             'per-step Python/autograd overhead from the manual '
+                             'time-step loop (see rnn.py).')
     return parser.parse_args()
 
 
@@ -96,7 +100,7 @@ def main():
               f'w_v={p.w_v}  w_h={p.w_h}  fit_forget={p.fit_forget}')
 
     t0 = time.time()
-    scalars, model = train(config)
+    scalars, model = train(config, compile_model=args.compile)
     elapsed = time.time() - t0
     print(f'\nTraining complete. Final scalars: {scalars}')
     print(f'Training time: {elapsed:.1f}s ({elapsed/60:.1f} min)')

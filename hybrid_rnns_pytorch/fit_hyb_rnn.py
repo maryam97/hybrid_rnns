@@ -20,7 +20,7 @@ from .cogmod import CogMod
 from .rnn import RNN
 
 
-def train(config=None):
+def train(config=None, compile_model=False):
     """Fit one model (cogmod / RNN / biRNN) to human bandit task behaviour."""
 
     if config is None:
@@ -29,6 +29,13 @@ def train(config=None):
     # ------------------------------------------------------------------ device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
+
+    if device.type == 'cpu':
+        # The manual per-timestep unroll (see rnn.py) does ~150 tiny ops per
+        # training step. PyTorch's default intra-op thread pool adds sync
+        # overhead per op that dwarfs the op cost at this size, so a single
+        # thread outperforms the default multi-threaded backend here.
+        torch.set_num_threads(1)
 
     torch.manual_seed(config.random_seed)
 
@@ -46,6 +53,10 @@ def train(config=None):
         raise ValueError(f'Unknown model_name: {config.model_name!r}')
 
     model.to(device)
+    if compile_model:
+        # loss_fn/accuracy_fn call model.unroll(...) directly, not model(...),
+        # so compile that method rather than wrapping the module itself.
+        model.unroll = torch.compile(model.unroll)
 
     # ------------------------------------------------------- load & split data
     print(f'Loading data from {config.dataset_path}')
