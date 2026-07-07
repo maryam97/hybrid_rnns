@@ -125,13 +125,6 @@ def train(config=None):
 
     for step in range(config.n_training_steps):
         model.train()
-
-        # Decay LR by 10× at the halfway point
-        if step == config.n_training_steps // 2:
-            for g in optimizer.param_groups:
-                g['lr'] *= 0.1
-            print(f'Step {step}: LR decayed to {optimizer.param_groups[0]["lr"]:.2e}', flush=True)
-
         batch = hyb_rnn_utilities.get_batch(train_dat, config.batch_size, rng)
 
         optimizer.zero_grad()
