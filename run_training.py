@@ -47,9 +47,11 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=None,
                         help='AdamW weight decay (default: 1e-5).')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='Training batch size. Default: 64 for rnn, 32 for birnn (paper values).')
+                        help='Training batch size. Default: 64 for rnn, 128 for birnn (paper Table 1).')
     parser.add_argument('--steps', type=int, default=None,
                         help='Number of training steps (default: 1M).')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for model init and batch sampling (default: 42).')
     parser.add_argument('--save', action='store_true',
                         help='Whether to save the trained model weights.')
     parser.add_argument('--compile', action='store_true',
@@ -74,8 +76,8 @@ def main():
     if args.no_debug:
         config.debug = False
         config.n_training_steps = int(1e6)
-        # paper batch sizes: rnn=64, birnn=32
-        config.batch_size = 64 if args.model == 'rnn' else 32
+        # paper batch sizes (Table 1): rnn=64, birnn(Memory-ANN)=128
+        config.batch_size = 64 if args.model == 'rnn' else 128
     if args.dataset is not None:
         config.dataset_path = args.dataset
     if args.lr is not None:
@@ -88,6 +90,8 @@ def main():
         config.batch_size = args.batch_size
     if args.steps is not None:
         config.n_training_steps = args.steps
+    if args.seed is not None:
+        config.random_seed = args.seed
 
     print(f'Device      : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}')
     print(f'Model       : {config.model_name}')
