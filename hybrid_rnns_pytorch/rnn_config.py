@@ -110,18 +110,21 @@ def get_rnn_config() -> Config:
 
 
 def get_birnn_config() -> Config:
-    """Winning hybRNN config from the paper (notebook Example 2).
+    """Winning hybRNN config — "Memory-ANN" from paper Table 1.
 
-    Key differences from the generic default:
-      s=True          — hidden state fed back as input to both RNNs
-      zero_values=True — value update replaces (not adds to) chosen arm
-      w_v=1, w_h=1   — both streams contribute with full weight
-      fit_forget=True — forgetting factor is learned
-      hidden_size=16  — paper default (JAX code)
+    Paper Table 1 (Memory-ANN): hidden_size=32, batch_size=128, n_params=2,472,
+    accuracy=68.3%.  The notebook Example 2 uses hidden_size=16/batch_size=32
+    as a fast demo, NOT the paper-optimal config.
+
+    Parameter count verification (s=True, zero_values=True, hidden_size=32):
+      value_rnn  Linear(34→32): 1120  value_out  Linear(32→1): 33
+      habit_rnn  Linear(36→32): 1184  habit_out  Linear(32→4): 132
+      fit_init_v, fit_init_h, fit_forget: 3
+      Total: 2,472  ✓
     """
     config = Config()
     config.model_name = 'birnn'
-    config.network_params.hidden_size = 16
+    config.network_params.hidden_size = 32
     config.rnn_rl_params.w_v          = 1.0
     config.rnn_rl_params.w_h          = 1.0
     config.rnn_rl_params.fit_forget   = True

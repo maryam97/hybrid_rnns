@@ -131,6 +131,10 @@ def train(config=None, compile_model=False):
     rng.manual_seed(config.random_seed)
 
     scalars = {}
+    best_valid_acc  = -1.0
+    best_model_dict = None
+    best_step       = 0
+
     print('Start fitting the model')
     t_last = time.perf_counter()
 
@@ -152,15 +156,19 @@ def train(config=None, compile_model=False):
 
             model.eval()
             with torch.no_grad():
-                test_batch  = hyb_rnn_utilities.get_batch(
-                    test_dat,  config.batch_size, rng)
-                valid_batch = hyb_rnn_utilities.get_batch(
-                    valid_dat, config.batch_size, rng)
+                test_batch = hyb_rnn_utilities.get_batch(
+                    test_dat, config.batch_size, rng)
 
                 test_loss  = loss_fn(test_batch).item()
-                valid_loss = loss_fn(valid_batch).item()
                 test_acc   = accuracy_fn(test_batch)
-                valid_acc  = accuracy_fn(valid_batch)
+                # Full validation set for checkpoint selection — matches paper protocol
+                valid_loss = loss_fn(valid_dat).item()
+                valid_acc  = accuracy_fn(valid_dat)
+
+            if valid_acc > best_valid_acc:
+                best_valid_acc  = valid_acc
+                best_model_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_step       = step
 
             scalars.update({
                 'step':       step,
@@ -172,6 +180,10 @@ def train(config=None, compile_model=False):
             })
             print(f'Step: {step}\nScalars: {scalars}')
 
+    # ---- restore best checkpoint (selected on validation, matching paper protocol) ----
+    if best_model_dict is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_dict.items()})
+
     # ------------------------------------------------ final eval on full test set
     model.eval()
     with torch.no_grad():
@@ -180,12 +192,13 @@ def train(config=None, compile_model=False):
         final_valid_acc = accuracy_fn(valid_dat)
 
     scalars.update({
+        'best_step':       best_step,
         'final_test_loss': final_test_loss,
         'final_test_acc':  final_test_acc,
         'final_valid_acc': final_valid_acc,
     })
-    print(f'\n=== Final evaluation (all test blocks) ===')
-    print(f'Test  accuracy : {final_test_acc * 100:.2f}%  (paper target: ~68.3% for BiRNN)')
+    print(f'\n=== Final evaluation (best checkpoint at step {best_step}) ===')
+    print(f'Test  accuracy : {final_test_acc * 100:.2f}%  (paper target: 68.3%)')
     print(f'Valid accuracy : {final_valid_acc * 100:.2f}%')
     print(f'Test  loss     : {final_test_loss:.4f}')
 

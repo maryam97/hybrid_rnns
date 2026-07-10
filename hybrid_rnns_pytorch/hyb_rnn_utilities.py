@@ -12,7 +12,9 @@ def format_data_for_model_training(
 ) -> dict[str, torch.Tensor]:
     """Format a pandas DataFrame for model training.
 
-    Splits 80/10/10 by participant (matching the paper), not by block.
+    Splits 80/10/10 by participant (paper methodology): all blocks from a
+    participant land entirely in one split, so there is no leakage between
+    train and test.
 
     Returns a dict with keys 'train_dat', 'valid_dat', 'test_dat', each a
     float32 tensor of shape (n_blocks, n_trials, n_actions + 2).
@@ -37,20 +39,20 @@ def format_data_for_model_training(
     # Layout: [one-hot action (n_actions) | reward (1) | valid mask (1)]
     data_flat = torch.cat([actions_onehot, rewards, valid], dim=-1)   # (N, n_actions+2)
 
-    # ---- split by participant (80 / 10 / 10), matching the paper ----
+    # ---- split 80/10/10 by participant ----
     unique_subs = np.unique(hum_dat['s_id'].values)
     rng = np.random.default_rng(random_seed)
     rng.shuffle(unique_subs)
 
-    n_subs  = len(unique_subs)
-    n_held  = n_subs // 10                          # 10 % each for test & valid
-    test_subs  = set(unique_subs[:n_held])
-    valid_subs = set(unique_subs[n_held: 2 * n_held])
+    n_subs = len(unique_subs)
+    n_held = n_subs // 10                        # 10% each for valid & test
+    valid_subs = set(unique_subs[:n_held])
+    test_subs  = set(unique_subs[n_held: 2 * n_held])
     train_subs = set(unique_subs[2 * n_held:])
 
     def _blocks_for(subs):
-        mask    = np.isin(hum_dat['s_id'].values, list(subs))
-        sub_flat = data_flat[mask]                  # rows for these participants
+        mask     = np.isin(hum_dat['s_id'].values, list(subs))
+        sub_flat = data_flat[mask]
         n_blocks = sub_flat.shape[0] // n_trials
         return sub_flat[: n_blocks * n_trials].view(n_blocks, n_trials, -1)
 
