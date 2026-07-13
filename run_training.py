@@ -111,6 +111,7 @@ def main():
 
     results = {
         'model':           config.model_name,
+        'random_seed':     config.random_seed,
         'hidden_size':     config.network_params.hidden_size,
         'steps':           config.n_training_steps,
         'lr':              config.learning_rate,
@@ -121,14 +122,14 @@ def main():
         **scalars,
     }
     os.makedirs('results', exist_ok=True)
-    results_path = f'results/{config.model_name}_hs={config.network_params.hidden_size}_s={scalars["step"]}.json'
+    results_path = f'results/{config.model_name}_hs={config.network_params.hidden_size}_s={scalars["step"]}_seed={config.random_seed}.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {results_path}')
 
     if args.save:
         os.makedirs('trained_models', exist_ok=True)
-        save_path = f'trained_models/{args.model}_e={scalars["step"]}_pred.pt'
+        save_path = f'trained_models/{args.model}_hs={config.network_params.hidden_size}_e={scalars["step"]}_seed={config.random_seed}_pred.pt'
         torch.save(model.state_dict(), save_path)
         print(f'Weights saved to {save_path}')
 
