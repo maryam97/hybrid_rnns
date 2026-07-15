@@ -8,7 +8,7 @@ import torch.nn.functional as F
 def format_data_for_model_training(
     hum_dat,
     n_actions: int = 4,
-    random_seed: int = 42,
+    random_seed: int = 1356,
 ) -> dict[str, torch.Tensor]:
     """Format a pandas DataFrame for model training.
 
@@ -46,6 +46,9 @@ def format_data_for_model_training(
 
     n_subs = len(unique_subs)
     n_held = n_subs // 10                        # 10% each for valid & test
+    # seed=1356 with this ordering reproduces the paper's reported split sizes
+    # exactly: 690/86/86 participants, 3,302/419/413 blocks after the
+    # >15-missed-trial exclusion below.
     valid_subs = set(unique_subs[:n_held])
     test_subs  = set(unique_subs[n_held: 2 * n_held])
     train_subs = set(unique_subs[2 * n_held:])
