@@ -61,7 +61,8 @@ def train(config=None, compile_model=False):
     # ------------------------------------------------------- load & split data
     print(f'Loading data from {config.dataset_path}')
     hum_dat = pd.read_csv(config.dataset_path)
-    tensors = hyb_rnn_utilities.format_data_for_model_training(hum_dat)
+    tensors = hyb_rnn_utilities.format_data_for_model_training(
+        hum_dat, random_seed=config.random_seed)
 
     train_dat = tensors['train_dat'].to(device)
     valid_dat = tensors['valid_dat'].to(device)

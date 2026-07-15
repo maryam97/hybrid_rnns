@@ -54,7 +54,10 @@ def format_data_for_model_training(
         mask     = np.isin(hum_dat['s_id'].values, list(subs))
         sub_flat = data_flat[mask]
         n_blocks = sub_flat.shape[0] // n_trials
-        return sub_flat[: n_blocks * n_trials].view(n_blocks, n_trials, -1)
+        blocks   = sub_flat[: n_blocks * n_trials].view(n_blocks, n_trials, -1)
+        # Paper exclusion criterion: drop blocks with >15 missed trials (>10%)
+        valid_counts = blocks[:, :, n_actions + 1].sum(dim=1)  # valid mask is last col
+        return blocks[valid_counts >= (n_trials - 15)]
 
     train_dat = _blocks_for(train_subs)
     valid_dat = _blocks_for(valid_subs)
