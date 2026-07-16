@@ -47,10 +47,10 @@ def format_data_for_model_training(
     n_subs = len(unique_subs)
     n_held = n_subs // 10                        # 10% each for valid & test
     # seed=1356 with this ordering reproduces the paper's reported split sizes
-    # exactly: 690/86/86 participants, 3,302/419/413 blocks after the
-    # >15-missed-trial exclusion below.
-    valid_subs = set(unique_subs[:n_held])
-    test_subs  = set(unique_subs[n_held: 2 * n_held])
+    # exactly: 690/86/86 participants, 3,302/413/419 blocks (train/valid/test)
+    # after the >15-missed-trial exclusion below.
+    test_subs  = set(unique_subs[:n_held])
+    valid_subs = set(unique_subs[n_held: 2 * n_held])
     train_subs = set(unique_subs[2 * n_held:])
 
     def _blocks_for(subs):
