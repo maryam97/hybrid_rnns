@@ -13,15 +13,37 @@ Usage
 
 Backend / prior-structure combinations
 ---------------------------------------
-  scalar  + kron_ll  (default) : one scalar prior for last-layer Kron
-  scalar  + kron_ll            : same
-  layerwise + full             : one prior per param tensor (10 for BiRNN), full Hessian
+  scalar  + kron_ll  (default) : last-layer Kron (habit_out_linear only for BiRNN)
+  scalar  + kron                : all-Linear-layer Kron (habit AND value streams for
+                                 BiRNN), backed by AsdlGGN -- see note below.
+  layerwise + full              : one prior per param tensor, full Hessian, every
+                                 parameter including BiRNN's bare scalars.
                                  Recommended for best calibration on our small models.
-  scalar  + full               : one scalar prior, full Hessian (slower, rarely better)
+  scalar  + full                : one scalar prior, full Hessian (slower, rarely better)
 
-The kron/kron_full backends require use_rnn_cell=False AND all parameters inside
-nn.Linear (ASDL limitation). For BiRNN the two scalar nn.Parameters
-(_raw_init_value_v/h) cause KronLaplace to crash, so use 'kron_ll' or 'full'.
+All three require use_rnn_cell=False so the recurrence is a manual per-timestep
+loop over nn.Linear layers (no nn.RNN).
+
+'kron' uses AsdlGGN, not CurvlinopsGGN: AsdlGGN is ~2.5x faster for our models
+(measured 6.7s vs 16.2s to fit BiRNN's Kron over the full training set) and,
+once the two fixes below are applied, works fine despite habit_rnn_linear/
+value_rnn_linear being called once per timestep (149x per forward pass):
+  1. The wrapper's value stream must NOT be detached (detach_value=False,
+     wired below) -- ASDL's hooks only populate module.fisher for modules
+     that actually receive a backward gradient; if the value stream is
+     detached (as it is for 'kron_ll'), value_rnn_linear/value_out_linear
+     never get a `.fisher` stat, and multiplying Kron by a curvature factor
+     that's None for those blocks raises `TypeError: 'float' * NoneType`.
+     This was previously (mis)diagnosed as a fundamental ASDL weight-sharing
+     limitation -- it was actually this same detach bug.
+  2. Bare nn.Parameters (BiRNN's scalar init/forget values) can't be
+     Kron-factored by ASDL either (it only walks nn.Linear/nn.Conv modules),
+     and BaseLaplace snapshots which parameters it covers at construction
+     time -- so they must be frozen (requires_grad=False) BEFORE constructing
+     the Laplace object, not just around .fit(), or self.H's block count
+     silently drifts out of sync with what the backend actually returns.
+     freeze_non_linear_parameters() in laplace_compat.py handles this; those
+     parameters fall back to the scalar/layerwise prior, same as before.
 """
 
 import argparse
@@ -31,10 +53,10 @@ import time
 import torch
 import pandas as pd
 
-from laplace          import KronLLLaplace, FullLaplace
+from laplace          import KronLaplace, KronLLLaplace, FullLaplace
 from laplace.curvature import AsdlGGN, CurvlinopsGGN
 
-from hybrid_rnns_pytorch.rnn_config import get_config
+from hybrid_rnns_pytorch.rnn_config import get_config, get_rnn_config, get_birnn_config
 from hybrid_rnns_pytorch import hyb_rnn_utilities
 from hybrid_rnns_pytorch.laplace_compat import laplace_ready, make_dataloader
 from hybrid_rnns_pytorch.marglik_training import marglik_optimization
@@ -67,20 +89,26 @@ def parse_args():
                    help='Random seed for model init (default: 0). '
                         'Seed 42 is the rnn_config default but produces extreme '
                         'initial BiRNN logits — seed 0 is more stable.')
-    p.add_argument('--backend',      choices=['kron_ll', 'full'], default='kron_ll',
+    p.add_argument('--backend',      choices=['kron_ll', 'kron', 'full'], default='kron_ll',
                    help='Laplace backend. '
-                        '"kron_ll" = KronLLLaplace+AsdlGGN (default, last-layer Kron). '
-                        '"full"    = FullLaplace+CurvlinopsGGN (full Hessian, '
-                        'supports layerwise prior on all param types).')
+                        '"kron_ll" = KronLLLaplace+AsdlGGN (default, last-layer Kron '
+                        '            -- habit stream only for BiRNN). '
+                        '"kron"    = KronLaplace+AsdlGGN (all Linear layers -- habit '
+                        '            AND value streams for BiRNN, ~2.5x faster than '
+                        '            CurvlinopsGGN. Bare nn.Parameters (BiRNN scalar '
+                        '            init/forget values) are excluded from curvature '
+                        '            and covered by the prior only. '
+                        '"full"    = FullLaplace+CurvlinopsGGN (full Hessian over every '
+                        '            parameter including bare ones; slowest).')
     p.add_argument('--prior-structure', choices=['scalar', 'layerwise', 'diagonal'],
                    default=None,
-                   help='Prior structure. Default: "scalar" for kron_ll, '
+                   help='Prior structure. Default: "scalar" for kron_ll and kron, '
                         '"layerwise" for full. '
-                        '"layerwise" gives one prior precision per parameter tensor '
-                        '(10 for BiRNN) and is the recommended setting with --backend full.')
-    p.add_argument('--hidden-size',   type=int, default=64,
-                   help='Hidden units per RNN layer (default: 64, paper-optimal). '
-                        'Must match the checkpoint if loading one.')
+                        '"layerwise" gives one prior precision per parameter tensor.')
+    p.add_argument('--hidden-size',   type=int, default=None,
+                   help='Hidden units per RNN layer. Default: paper-optimal for '
+                        '--model (64 for rnn, 32 for birnn) -- only pass this to '
+                        'override, e.g. to match a checkpoint\'s hidden_size.')
     return p.parse_args()
 
 
@@ -93,10 +121,15 @@ def _build_model(config):
 def main():
     args = parse_args()
 
-    config             = get_config()
-    config.model_name  = args.model
+    # Model-specific paper-verified configs (s=True hidden-state feedback for
+    # RNN; w_v=1/w_h=1/fit_forget=True/zero_values=True for BiRNN) -- NOT
+    # get_config(), which is a generic placeholder with these flags off and
+    # caps achievable accuracy well below what run_training.py reaches
+    # regardless of how much marglik training is run.
+    config = get_birnn_config() if args.model == 'birnn' else get_rnn_config()
     config.dataset_path = args.dataset
-    config.network_params.hidden_size = args.hidden_size
+    if args.hidden_size is not None:
+        config.network_params.hidden_size = args.hidden_size
     config.network_params.use_rnn_cell = False
     # Weight decay is NOT applied here: the Laplace prior precision already acts
     # as L2 regularization and is optimised via marginal likelihood. Adding
@@ -109,14 +142,18 @@ def main():
 
     # ---- resolve backend / prior-structure -----------------------------------
     if args.backend == 'kron_ll':
-        laplace_cls = KronLLLaplace
-        backend_cls = AsdlGGN
+        laplace_cls  = KronLLLaplace
+        backend_cls  = AsdlGGN
         prior_struct = args.prior_structure or 'scalar'
         if prior_struct != 'scalar':
             raise ValueError('--backend kron_ll only supports --prior-structure scalar')
+    elif args.backend == 'kron':
+        laplace_cls  = KronLaplace
+        backend_cls  = AsdlGGN
+        prior_struct = args.prior_structure or 'scalar'
     else:  # 'full'
-        laplace_cls = FullLaplace
-        backend_cls = CurvlinopsGGN
+        laplace_cls  = FullLaplace
+        backend_cls  = CurvlinopsGGN
         prior_struct = args.prior_structure or 'layerwise'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -150,9 +187,13 @@ def main():
     print(f'DataLoader: {len(train_loader)} batches/epoch')
 
     # ---- build model and wrap ----
+    # detach_value=False for 'kron'/'full': both are meant to cover the value
+    # stream too (see laplace_compat.py docstring); 'kron_ll' keeps the
+    # last-layer approximation, so the value stream stays detached.
     torch.manual_seed(args.seed)
     model   = _build_model(config).to(device)
-    wrapped = laplace_ready(model, n_actions=config.network_params.n_actions)
+    wrapped = laplace_ready(model, n_actions=config.network_params.n_actions,
+                             detach_value=(args.backend == 'kron_ll'))
 
     # Materialise any LazyLinear layers before Laplace sees the model
     with torch.no_grad():
@@ -160,6 +201,10 @@ def main():
         wrapped(dummy_x)
 
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())}')
+
+    # ---- held-out test set (same 80/10/10 participant split as normal training) ----
+    tensors  = hyb_rnn_utilities.format_data_for_model_training(hum_dat)
+    test_dat = tensors['test_dat'].to(device)
 
     # ---- marginal-likelihood training ----
     t0 = time.time()
@@ -178,35 +223,54 @@ def main():
     )
 
     elapsed = time.time() - t0
+
+    # ---- restore best weights then evaluate on full held-out test set ----
+    if best_model_dict is not None:
+        wrapped.load_state_dict(best_model_dict)
+
+    n_actions = config.network_params.n_actions
+    inner_model = wrapped.model
+    inner_model.eval()
+    with torch.no_grad():
+        test_input = test_dat[:, :, :n_actions + 1]
+        action_probs_seq, _ = inner_model.unroll(test_input)
+        action_probs_seq = (1 - 1e-5) * action_probs_seq + 5e-4
+        targets  = test_dat[:, 1:, :n_actions]
+        mask     = test_dat[:, 1:, n_actions + 1]
+        preds    = action_probs_seq[:, :-1]
+        step_nll = -(torch.log(preds) * targets).sum(dim=-1)
+        n_valid  = mask.sum()
+        test_acc = torch.exp(-(step_nll * mask).sum() / n_valid).item()
+        test_argmax_acc = ((preds.argmax(-1) == targets.argmax(-1)) * mask).sum().item() / n_valid.item()
+
     print(f'\n=== Done ===')
     print(f'Training time  : {elapsed:.1f}s ({elapsed/60:.1f} min)')
-    print(f'Best marglik : {best_marglik:.4f}')
+    print(f'Best marglik   : {best_marglik:.4f}')
+    print(f'Test acc       : {test_acc*100:.2f}%  (paper target: ~68.3%)')
     print(f'Prior precision: {best_precision}')
 
     results = {
-        'model':           args.model,
-        'hidden_size':     args.hidden_size,
-        'backend':         args.backend,
-        'prior_structure': prior_struct,
-        'epochs':          n_epochs,
-        'lr':              args.lr,
-        'lr_hyp':          args.lr_hyp,
-        'seed':            args.seed,
-        'best_marglik':    round(best_marglik, 4),
-        'best_precision':  best_precision.tolist() if best_precision is not None else None,
-        'training_time_s': round(elapsed, 1),
+        'model':            args.model,
+        'hidden_size':      config.network_params.hidden_size,
+        'backend':          args.backend,
+        'prior_structure':  prior_struct,
+        'epochs':           n_epochs,
+        'lr':               args.lr,
+        'lr_hyp':           args.lr_hyp,
+        'seed':             args.seed,
+        'best_marglik':     round(best_marglik, 4),
+        'best_precision':   best_precision.tolist() if best_precision is not None else None,
+        'test_acc':         round(test_acc, 4),
+        'test_argmax_acc':  round(test_argmax_acc, 4),
+        'training_time_s':  round(elapsed, 1),
     }
     os.makedirs('results', exist_ok=True)
-    results_path = f'results/{args.model}_marglik_be={args.backend}_e={n_epochs}.json'
+    results_path = f'results/{args.model}_marglik_be={args.backend}_e={n_epochs}_hs={config.network_params.hidden_size}.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {results_path}')
 
-    # Restore best weights
-    if best_model_dict is not None:
-        wrapped.load_state_dict(best_model_dict)
-
-    save_path = args.save or f'trained_models/{args.model}_marglik_be={args.backend}_e={n_epochs}.pt'
+    save_path = args.save or f'trained_models/{args.model}_marglik_be={args.backend}_e={n_epochs}_hs={config.network_params.hidden_size}.pt'
     torch.save(model.state_dict(), save_path)
     print(f'Weights saved to {save_path}')
 

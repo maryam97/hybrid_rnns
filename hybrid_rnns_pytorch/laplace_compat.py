@@ -13,9 +13,20 @@ Because our models are sequence models, the wrapper:
      Laplace's feature hook captures the full set of predictions in one shot
   5. Returns raw logits (batch*(T-1), n_actions) — no softmax
 
-BiRNN note: last-layer Laplace is applied to habit_out_linear only.  The
-value stream is treated as a fixed offset (detached from the gradient graph).
-This is an approximation; for full uncertainty use subset_of_weights='all'.
+BiRNN note: by default (detach_value=True) last-layer Laplace is applied to
+habit_out_linear only, and the value stream is treated as a fixed offset
+(detached from the gradient graph) -- this is the last-layer approximation.
+
+For any Laplace fit that is supposed to cover MORE than the last layer
+(subset_of_weights='all', or hessian_structure='kron'/'full' over the whole
+model), the wrapper must be built with detach_value=False, otherwise
+value_rnn_linear / value_out_linear (and any bare nn.Parameter that only
+feeds the value stream, e.g. BiRNN's _raw_init_value_v/h, _raw_forget) get
+ZERO curvature silently -- Curvlinops' Jacobian-based backends don't error on
+unused parameters, they just report a zero block, so this bug is easy to
+miss. See freeze_non_linear_parameters() below for the companion fix needed
+for Kron-structured (KFAC) fits, which additionally require every parameter
+handed to them to live inside a supported layer (nn.Linear/nn.Conv).
 
 Usage
 -----
@@ -40,6 +51,8 @@ Usage
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,8 +73,11 @@ class SequenceDataset(torch.utils.data.Dataset):
         x : (n_trials, n_actions+2)   — full sequence including valid-mask column
         y : (n_trials-1,)             — action class indices at t+1
 
-    Missed trials (valid == 0) are kept in y as class 0 (the clipped index).
-    This is a minor approximation; they make up a small fraction of trials.
+    Missed trials (valid == 0) are kept in y as class 0 (the clipped index) --
+    this is an arbitrary placeholder, NOT a real label. Callers MUST mask
+    using the valid-mask column (x[:, 1:, -1]) before computing any loss or
+    metric from y, or the model/evaluation will be trained/scored against
+    this placeholder as if it were a real target on every missed trial.
     """
 
     def __init__(self, tensor: torch.Tensor, n_actions: int = 4):
@@ -92,7 +108,8 @@ class SequenceModelWrapper(nn.Module):
     Laplace's feature hook captures the complete (batch*(T-1), hidden) matrix.
     """
 
-    def __init__(self, model: RNN | BiRNN, n_actions: int, n_trials: int):
+    def __init__(self, model: RNN | BiRNN, n_actions: int, n_trials: int,
+                 detach_value: bool = True):
         super().__init__()
 
         if isinstance(model, CogMod):
@@ -103,9 +120,14 @@ class SequenceModelWrapper(nn.Module):
         if not isinstance(model, (RNN, BiRNN)):
             raise TypeError(f"Unsupported model type: {type(model)}")
 
-        self.model     = model
-        self.n_actions = n_actions
-        self.n_trials  = n_trials
+        self.model        = model
+        self.n_actions     = n_actions
+        self.n_trials      = n_trials
+        # BiRNN only: detach the value stream so Laplace's last-layer hook
+        # sees only habit_out_linear. Must be False for any subset/hessian
+        # setting that is meant to cover the value stream too (see module
+        # docstring) -- otherwise those params silently get zero curvature.
+        self.detach_value = detach_value
 
     # ------------------------------------------------------------------
 
@@ -215,8 +237,12 @@ class SequenceModelWrapper(nn.Module):
         habit_logits  = model.habit_out_linear(features)                        # (N, n_actions)
         value_offsets = torch.stack(v_outputs, dim=1).contiguous().view(-1, model._n_actions)
 
-        # Pre-softmax combination; detach value so Laplace gradient only covers habit head
-        logits = model.beta * (model._w_v * value_offsets.detach() + model._w_h * habit_logits)
+        # Pre-softmax combination. detach_value=True keeps Laplace's gradient
+        # confined to the habit head (last-layer approximation); set False to
+        # let curvature flow through value_rnn_linear/value_out_linear too.
+        if self.detach_value:
+            value_offsets = value_offsets.detach()
+        logits = model.beta * (model._w_v * value_offsets + model._w_h * habit_logits)
         return logits
 
     # ------------------------------------------------------------------
@@ -234,6 +260,7 @@ def laplace_ready(
     model: RNN | BiRNN,
     n_actions: int = 4,
     n_trials:  int = 150,
+    detach_value: bool = True,
 ) -> SequenceModelWrapper:
     """Return a laplace-torch-compatible wrapper around a trained model.
 
@@ -246,9 +273,115 @@ def laplace_ready(
                      subset_of_weights='last_layer',
                      hessian_structure='kron',
                      last_layer_name='model.output_linear')   # RNN example
+
+    detach_value : bool
+        BiRNN only (ignored for RNN). Keep the default True for
+        subset_of_weights='last_layer'. Set to False whenever the Laplace
+        fit is meant to cover more than habit_out_linear (subset='all',
+        or any Kron/full Hessian over the whole model) -- otherwise the
+        value stream's parameters get silently zeroed-out curvature.
     """
     model.eval()
-    return SequenceModelWrapper(model, n_actions=n_actions, n_trials=n_trials)
+    return SequenceModelWrapper(model, n_actions=n_actions, n_trials=n_trials,
+                                 detach_value=detach_value)
+
+
+# ---------------------------------------------------------------------------
+# KFAC / Kron helper: exclude bare nn.Parameters from curvature
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def freeze_non_linear_parameters(module: nn.Module):
+    """Temporarily set requires_grad=False on every parameter NOT owned by an
+    nn.Linear submodule, then restore the original requires_grad on exit.
+
+    Why this is needed: Kron-structured (KFAC) curvature backends -- both
+    laplace-torch's ASDL backend and its Curvlinops backend -- only know how
+    to Kronecker-factor nn.Linear/nn.Conv layers. Any bare nn.Parameter that
+    still has requires_grad=True (BiRNN's scalar _raw_init_value_v/h and
+    _raw_forget) makes Curvlinops' KFACLinearOperator raise
+    "Found parameters in un-supported layers", since CurvatureInterface.params
+    is built from `p for p in model.parameters() if p.requires_grad`.
+
+    Freezing them here only affects what the Laplace/KFAC fit "sees" for the
+    duration of the `with` block; they are unfrozen immediately after, so the
+    normal training-loop optimizer step (which regularises ALL parameters via
+    the scalar/layerwise prior) is unaffected.
+
+    Usage
+    -----
+        with freeze_non_linear_parameters(wrapped):
+            la = KronLaplace(wrapped, 'classification', backend=CurvlinopsGGN)
+            la.fit(train_loader)
+    """
+    linear_param_ids = {
+        id(p)
+        for m in module.modules()
+        if isinstance(m, nn.Linear)
+        for p in m.parameters()
+    }
+    frozen = [p for p in module.parameters()
+              if p.requires_grad and id(p) not in linear_param_ids]
+    for p in frozen:
+        p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p in frozen:
+            p.requires_grad_(True)
+
+
+# ---------------------------------------------------------------------------
+# N (dataset size) correction: blocks vs. flattened (block, timestep) samples
+# ---------------------------------------------------------------------------
+
+def count_valid_samples(loader_or_dataset) -> int:
+    """Total number of valid (non-missed) (block, timestep) predictions in a
+    SequenceDataset/DataLoader built by make_dataloader().
+
+    Why this matters: laplace-torch computes `N = len(train_loader.dataset)`
+    and expects it in the SAME units as `M = len(y)` per batch -- see
+    Curvlinops' `_rescale_kron_factors`: "Renormalize Kronecker factor to sum
+    up correctly over N data points with batches of M." Our collate_fn
+    flattens each block's (n_trials-1) timesteps into the sample axis, so `M`
+    counts (block, timestep) pairs -- but `SequenceDataset.__len__()` must
+    return the number of BLOCKS (DataLoader indexing depends on it). Passing
+    that block-count as N under-counts the true sample size by ~n_trials
+    (~149x here), making the Kron-fit's implicit evidence-vs-complexity
+    tradeoff -- and hence the marglik-optimal prior precision -- far too
+    concentrated on regularisation relative to fit.
+    """
+    dataset = getattr(loader_or_dataset, 'dataset', loader_or_dataset)
+    return int(dataset.tensor[:, 1:, -1].sum().item())
+
+
+def fit_kron_with_correct_N(laplace_obj, train_loader) -> None:
+    """Fit a Kron-structured Laplace object (KronLaplace/KronLLLaplace) on
+    train_loader, then rescale its Hessian to correct for laplace-torch's
+    `N = len(train_loader.dataset)` under-counting the true sample size (see
+    count_valid_samples).
+
+    Can't just pass the correct N into `.fit()` (no such kwarg) or monkeypatch
+    `train_loader.dataset` (PyTorch's DataLoader raises ValueError on
+    reassignment after construction). Instead: the per-batch Kron rescale is
+    `F *= M/N_wrong` (Curvlinops) / `F *= 1/N_wrong` (ASDL), a pure scalar
+    factor -- so after `.fit()` accumulates the (wrongly-scaled) Hessian, the
+    CORRECTLY-scaled one is exactly `H * (N_wrong / N_correct)`. Both `Kron`
+    and `KronDecomposed` (what `self.H` becomes post-fit) support `*` with a
+    scalar for exactly this kind of rescaling.
+
+    The log-likelihood term itself does NOT need correcting: it accumulates
+    `CrossEntropyLoss(reduction='sum')` batch sums directly, with no N
+    dependence, so it's already correctly scaled regardless of N.
+
+    Only applies to Kron-structured fits: FullLaplace's Curvlinops backend
+    discards the `N` kwarg entirely (see `CurvlinopsInterface.full`), so it
+    was never affected by this bug in the first place.
+    """
+    laplace_obj.fit(train_loader)
+    n_wrong   = len(train_loader.dataset)
+    n_correct = count_valid_samples(train_loader)
+    laplace_obj.H = laplace_obj.H * (n_wrong / n_correct)
 
 
 def make_dataloader(
