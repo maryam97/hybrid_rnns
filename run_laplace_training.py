@@ -109,6 +109,10 @@ def parse_args():
                    help='Hidden units per RNN layer. Default: paper-optimal for '
                         '--model (64 for rnn, 32 for birnn) -- only pass this to '
                         'override, e.g. to match a checkpoint\'s hidden_size.')
+    p.add_argument('--compile', action='store_true',
+                   help='torch.compile() the plain SGD training/eval forward pass '
+                        '(not the Laplace/ASDL curvature fit -- see '
+                        'marglik_training.py\'s compile_model docstring).')
     return p.parse_args()
 
 
@@ -220,6 +224,7 @@ def main():
         marglik_frequency = args.marglik_freq,
         laplace           = laplace_cls,
         backend           = backend_cls,
+        compile_model     = args.compile,
     )
 
     elapsed = time.time() - t0

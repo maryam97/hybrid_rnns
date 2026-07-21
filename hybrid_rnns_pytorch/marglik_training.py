@@ -103,6 +103,7 @@ def marglik_optimization(
     lr_hyp=1e-1,
     laplace=KronLLLaplace,
     backend=AsdlGGN,
+    compile_model=False,
 ):
     """Joint optimisation of model weights and prior precision via marginal likelihood.
 
@@ -143,6 +144,17 @@ def marglik_optimization(
     backend : curvature backend
         Default: AsdlGGN. Use CurvlinopsGGN with `laplace=FullLaplace`, or as
         a slower fallback for `laplace=KronLaplace` (see module docstring).
+    compile_model : bool
+        torch.compile() the plain SGD training/eval forward pass only. Does
+        NOT touch the forward calls Laplace/ASDL/Curvlinops make internally
+        during `.fit()` / `log_marginal_likelihood()` -- those rely on
+        forward/backward hooks to capture per-layer curvature stats (see
+        laplace_compat.py and the module docstring), and compiling the graph
+        those hooks fire inside risks silently breaking that capture. The
+        recurrence's manual per-timestep Python loop (see laplace_compat.py's
+        SequenceModelWrapper) is exactly the kind of many-tiny-ops pattern
+        torch.compile targets, so this is worth trying for the SGD passes,
+        which dominate wall time when marglik_frequency > 1.
 
     Returns
     -------
@@ -154,9 +166,21 @@ def marglik_optimization(
         Best (lowest) marginal likelihood value seen during training.
     """
     device = parameters_to_vector(model.parameters()).device
+    if device.type == 'cpu':
+        # See fit_hyb_rnn.py: the manual per-timestep recurrence does ~149
+        # tiny ops per forward call, and PyTorch's default intra-op thread
+        # pool adds per-op sync overhead that dwarfs the op cost at this
+        # size, so single-threaded outperforms the multi-threaded default.
+        torch.set_num_threads(1)
     # NOT len(train_loader.dataset) (block count) -- see module docstring.
     N = count_valid_samples(train_loader)
     H = len(list(model.parameters()))
+
+    # Compiled only for the plain SGD forward pass below -- NOT used for the
+    # `laplace(model, ...)` construction/fit further down, which needs the
+    # uncompiled graph for its forward/backward hooks to reliably capture
+    # curvature (see compile_model in the docstring above).
+    forward_fn = torch.compile(model) if compile_model else model
 
     # ---- differentiable hyperparameter: log prior precision ----
     log_prior_prec_init = np.log(prior_prec_init)
@@ -208,7 +232,7 @@ def marglik_optimization(
             theta      = parameters_to_vector(model.parameters())
             delta      = expand_prior_precision(prior_prec, model)
 
-            f    = model(X)
+            f    = forward_fn(X)
             # Missed trials get an arbitrary y=argmax(all-zero)=0 label from
             # SequenceDataset -- must exclude them from the likelihood term or
             # the model is trained to predict class 0 on every missed trial.
@@ -234,7 +258,7 @@ def marglik_optimization(
         with torch.no_grad():
             for X, y in train_loader:
                 X, y = X.to(device), y.to(device)
-                f    = model(X)
+                f    = forward_fn(X)
                 mask = X[:, 1:, -1].reshape(-1).bool()
                 f_v, y_v = f[mask], y[mask]
                 nll_sum  += F.cross_entropy(f_v, y_v, reduction='sum').item()
