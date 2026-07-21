@@ -63,7 +63,7 @@ class RLParams:
 class Config:
     debug: bool = True
 
-    random_seed:  int = 1356  # gives exact paper block counts: train=3302, valid=413, test=419
+    random_seed:  int = 1356  # gives exact paper block counts: train=3302, valid=419, test=413
     dataset_path: str = 'hybrid_rnns_pytorch/data/openSourceRawDataset.csv' #smallExampleDataset
 
     n_trials:   int = 150
