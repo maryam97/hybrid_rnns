@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from hybrid_rnns_pytorch.rnn_config import get_birnn_config, get_rnn_config
-from hybrid_rnns_pytorch.hyb_rnn_utilities import load_osf_dataframe
+from hybrid_rnns_pytorch.hyb_rnn_utilities import MAX_MISSED, load_osf_dataframe
 from hybrid_rnns_pytorch.bi_rnn import BiRNN
 from hybrid_rnns_pytorch.rnn import RNN
 
@@ -83,9 +83,11 @@ def generate_choices(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the model generatively through all blocks and sample actions.
 
-    Starts from the model's initial state with a zero input (no prior action
-    or reward), then feeds each sampled action together with its correct payout
-    back as input for the next trial.
+    Same recurrence as training: from the initial state, trial t's (action,
+    reward) goes in and the output gives the probabilities for trial t + 1.
+    Trial 0 is drawn from the policy the initial state implies, which is uniform
+    (BiRNN: equal initial values/habits; RNN: zero initial output). Feeding a
+    zero "no action" input first would shift every later state by one step.
 
     Parameters
     ----------
@@ -108,19 +110,17 @@ def generate_choices(
 
     model.eval()
     with torch.no_grad():
-        state       = model.initial_state(n_blocks, device)
-        prev_onehot = torch.zeros(n_blocks, n_actions, device=device)
-        prev_reward = torch.zeros(n_blocks, device=device)
+        state = model.initial_state(n_blocks, device)
+        probs = torch.full((n_blocks, n_actions), 1.0 / n_actions, device=device)  # trial 0
 
         for t in range(n_trials):
-            inp          = torch.cat([prev_onehot, prev_reward.unsqueeze(-1)], dim=-1)
-            probs, state = model.forward(inp, state)
-
-            sampled      = torch.distributions.Categorical(probs=probs).sample()
+            sampled = torch.distributions.Categorical(probs=probs).sample()
             gen_action_list.append(sampled)
 
-            prev_onehot = F.one_hot(sampled, num_classes=n_actions).float()
-            prev_reward = payouts[torch.arange(n_blocks), t, sampled]
+            reward       = payouts[torch.arange(n_blocks), t, sampled]
+            inp          = torch.cat([F.one_hot(sampled, num_classes=n_actions).float(),
+                                      reward.unsqueeze(-1)], dim=-1)
+            probs, state = model.forward(inp, state)          # -> trial t + 1
 
     gen_actions_t = torch.stack(gen_action_list, dim=1)              # (n_blocks, n_trials)
     bix = torch.arange(n_blocks).unsqueeze(1).expand_as(gen_actions_t)
@@ -165,6 +165,9 @@ def main():
     if not args.no_debug:
         hum_dat = hum_dat[hum_dat['s_id'].isin(hum_dat['s_id'].unique()[:20])]
         print(f'Debug mode : {hum_dat["s_id"].nunique()} participants')
+    # Simulate the paper's 4,134 tasks: drop the 24 blocks with > MAX_MISSED missed trials.
+    n_missed = (hum_dat['action'] < 0).groupby([hum_dat['s_id'], hum_dat['block']]).transform('sum')
+    hum_dat  = hum_dat[n_missed <= MAX_MISSED]
 
     hum_dat  = hum_dat.sort_values(['s_id', 'block', 'trial_id']).reset_index(drop=True)
     n_trials = hum_dat['trial_id'].nunique()
