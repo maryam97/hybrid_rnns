@@ -11,7 +11,6 @@ or import and call train(config) directly.
 
 import time
 import torch
-import pandas as pd
 
 from . import hyb_rnn_utilities
 from .rnn_config import get_config
@@ -54,15 +53,15 @@ def train(config=None, compile_model=False):
 
     model.to(device)
     if compile_model:
-        # loss_fn/accuracy_fn call model.unroll(...) directly, not model(...),
+        # loss_fn/eval_metrics call model.unroll(...) directly, not model(...),
         # so compile that method rather than wrapping the module itself.
         model.unroll = torch.compile(model.unroll)
 
     # ------------------------------------------------------- load & split data
     print(f'Loading data from {config.dataset_path}')
-    hum_dat = pd.read_csv(config.dataset_path)
+    hum_dat = hyb_rnn_utilities.load_osf_dataframe(config.dataset_path)   # rewards 0-1
     tensors = hyb_rnn_utilities.format_data_for_model_training(
-        hum_dat, random_seed=config.random_seed)
+        hum_dat, n_actions=config.network_params.n_actions, split_file=config.split_path)
 
     train_dat = tensors['train_dat'].to(device)
     valid_dat = tensors['valid_dat'].to(device)
@@ -100,39 +99,23 @@ def train(config=None, compile_model=False):
         loss = -(torch.log(preds) * targets * mask.unsqueeze(-1)).sum() / batch_dat.shape[0]
         return loss
 
-    def accuracy_fn(batch_dat: torch.Tensor) -> float:
-        """Paper accuracy: exp(-mean NLL per trial) — equation from Methods p.13.
+    def eval_metrics(batch_dat: torch.Tensor) -> dict:
+        """NLL per block and accuracy, computed as in the paper.
 
-        This is the geometric mean probability assigned to the correct action,
-        NOT the fraction of argmax-correct predictions.
-
-        batch_dat: (batch, time, n_actions + 2)  — last column is valid mask
+        acc_paper = mean over blocks of exp(-NLL_block / 150), as in the paper's
+        Methods and Supp. Table 6. acc_pooled = exp(-total NLL / valid trials),
+        which is ~2 points lower and not comparable to the paper.
         """
-        model_input = batch_dat[:, :, :n_actions + 1]
-        action_probs_seq, _ = model.unroll(model_input)          # (batch, time, n_actions)
-        action_probs_seq = (1 - 1e-5) * action_probs_seq + 5e-4
-
-        targets = batch_dat[:, 1:, :n_actions]                   # (batch, time-1, n_actions)
-        mask    = batch_dat[:, 1:, n_actions + 1]                # (batch, time-1)
-        preds   = action_probs_seq[:, :-1]                       # (batch, time-1, n_actions)
-
-        # NLL per step: -log p(chosen action)
-        step_nll = -(torch.log(preds) * targets).sum(dim=-1)     # (batch, time-1)
-
-        # Mean NLL per trial averaged over valid steps only
-        n_valid       = mask.sum()
-        mean_nll      = (step_nll * mask).sum() / n_valid
-
-        # Paper formula: acc = exp(-L / (bs * ntrials)), ntrials = 150
-        # Equivalent here: exp(-mean NLL per valid trial)
-        return torch.exp(-mean_nll).item()
+        probs, _ = model.unroll(batch_dat[:, :, :n_actions + 1])
+        nll = hyb_rnn_utilities.block_nll(probs[:, :-1], batch_dat, n_actions)
+        return hyb_rnn_utilities.accuracy_metrics(nll, batch_dat, n_actions)
 
     # ---------------------------------------------------------------- training
     rng = torch.Generator()
     rng.manual_seed(config.random_seed)
 
     scalars = {}
-    best_valid_acc  = -1.0
+    best_valid_nll  = float('inf')
     best_model_dict = None
     best_step       = 0
 
@@ -150,7 +133,7 @@ def train(config=None, compile_model=False):
 
         scalars['train_loss'] = loss.item()
 
-        if step % 500 == 0:
+        if step % 500 == 0 or step == config.n_training_steps - 1:   # last step is a selection candidate too
             t_now     = time.perf_counter()
             elapsed   = t_now - t_last
             t_last    = t_now
@@ -160,48 +143,49 @@ def train(config=None, compile_model=False):
                 test_batch = hyb_rnn_utilities.get_batch(
                     test_dat, config.batch_size, rng)
 
-                test_loss  = loss_fn(test_batch).item()
-                test_acc   = accuracy_fn(test_batch)
-                # Full validation set for checkpoint selection — matches paper protocol
-                valid_loss = loss_fn(valid_dat).item()
-                valid_acc  = accuracy_fn(valid_dat)
+                test_m  = eval_metrics(test_batch)   # random batch: noisy, for monitoring only
+                # Full validation set for checkpoint selection (paper: best fit on validation)
+                valid_m = eval_metrics(valid_dat)
 
-            if valid_acc > best_valid_acc:
-                best_valid_acc  = valid_acc
+            if valid_m['nll_per_block'] < best_valid_nll:
+                best_valid_nll  = valid_m['nll_per_block']
                 best_model_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_step       = step
 
             scalars.update({
-                'step':       step,
-                'test_loss':  test_loss,
-                'valid_loss': valid_loss,
-                'test_acc':   test_acc,
-                'valid_acc':  valid_acc,
-                'secs_per_500_steps': round(elapsed, 2),
+                'monitor_step':                     step,
+                'monitor_test_batch_nll_per_block': test_m['nll_per_block'],
+                'monitor_valid_nll_per_block':      valid_m['nll_per_block'],
+                'monitor_valid_acc_paper':          valid_m['acc_paper'],
+                'secs_per_500_steps':         round(elapsed, 2),
             })
             print(f'Step: {step}\nScalars: {scalars}')
 
-    # ---- restore best checkpoint (selected on validation, matching paper protocol) ----
-    if best_model_dict is not None:
-        model.load_state_dict({k: v.to(device) for k, v in best_model_dict.items()})
-
-    # ------------------------------------------------ final eval on full test set
+    # ------------------------------------------------ final eval on full sets
+    # Last-step weights (what the author's notebook and upstream report), then
+    # the best checkpoint on validation NLL (the paper's selection rule).
     model.eval()
     with torch.no_grad():
-        final_test_loss = loss_fn(test_dat).item()
-        final_test_acc  = accuracy_fn(test_dat)
-        final_valid_acc = accuracy_fn(valid_dat)
+        last_test, last_valid = eval_metrics(test_dat), eval_metrics(valid_dat)
+    if best_model_dict is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_dict.items()})
+    with torch.no_grad():
+        best_test, best_valid = eval_metrics(test_dat), eval_metrics(valid_dat)
 
-    scalars.update({
-        'best_step':       best_step,
-        'final_test_loss': final_test_loss,
-        'final_test_acc':  final_test_acc,
-        'final_valid_acc': final_valid_acc,
-    })
-    print(f'\n=== Final evaluation (best checkpoint at step {best_step}) ===')
-    print(f'Test  accuracy : {final_test_acc * 100:.2f}%  (paper target: 68.3%)')
-    print(f'Valid accuracy : {final_valid_acc * 100:.2f}%')
-    print(f'Test  loss     : {final_test_loss:.4f}')
+    scalars['best_step'] = best_step
+    for tag, m in [('test', best_test), ('valid', best_valid),
+                   ('last_step_test', last_test), ('last_step_valid', last_valid)]:
+        scalars.update({f'{tag}_{k}': v for k, v in m.items()})
+
+    print(f'\n=== Final evaluation on the full test set ({len(test_dat)} blocks) ===')
+    for name, m in [(f'best checkpoint (step {best_step})', best_test), ('last step', last_test)]:
+        print(f"{name:28s}: NLL/block {m['nll_per_block']:.2f} | acc {m['acc_paper'] * 100:.2f}% "
+              f"(pooled {m['acc_pooled'] * 100:.2f}%)")
+    hidden = config.network_params.hidden_size
+    if config.model_name == 'birnn' and hidden == 32:
+        print('Paper Memory-ANN: NLL/block 61.3, acc 68.3%')
+    elif config.model_name == 'rnn' and hidden == 64:
+        print('Paper vanilla RNN: NLL/block 61.7, acc 68.1%')
 
     return scalars, model
 

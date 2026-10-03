@@ -1,28 +1,32 @@
 """run_laplace_training.py — Train from scratch with Laplace marginal likelihood.
 
-Jointly optimises model weights and prior precision over ALL data (no split).
+Jointly optimises model weights and prior precision. By default the model is
+fitted on the WHOLE data: all 4,134 kept blocks of the paper's dataset (the 24
+blocks with >15 missed trials are excluded, as in the paper). The result is the
+log marginal likelihood (evidence) for model comparison; test-set accuracies are
+then in-sample. Paper-comparable held-out accuracies come from run_training.py
+(trained on the paper's train split, scored on its 413 test blocks).
 
 Usage
 -----
-    python run_laplace_training.py                               # birnn, scalar, debug
-    python run_laplace_training.py --model rnn
-    python run_laplace_training.py --no-debug --epochs 500
-    python run_laplace_training.py --prior-structure layerwise  # one precision per param tensor
-    python run_laplace_training.py --backend full               # FullLaplace+CurvlinopsGGN
-                                                                # required for layerwise on BiRNN
+    python run_laplace_training.py --no-debug                    # birnn, all data, kron
+    python run_laplace_training.py --no-debug --model rnn
+    python run_laplace_training.py --no-debug --fit-on train     # keep test held out
+    python run_laplace.py --checkpoint trained_models/<this run>.pt   # exact-GGN evidence afterwards
 
 Backend / prior-structure combinations
 ---------------------------------------
-  scalar  + kron_ll  (default) : last-layer Kron (habit_out_linear only for BiRNN)
-  scalar  + kron                : all-Linear-layer Kron (habit AND value streams for
-                                 BiRNN), backed by AsdlGGN -- see note below.
-  layerwise + full              : one prior per param tensor, full Hessian, every
-                                 parameter including BiRNN's bare scalars.
-                                 Recommended for best calibration on our small models.
-  scalar  + full                : one scalar prior, full Hessian (slower, rarely better)
+  scalar + kron (default) : all-Linear-layer Kron (habit AND value streams for
+                            BiRNN), AsdlGGN -- see notes below. Good for choosing
+                            the prior during training; report the evidence from
+                            run_laplace.py --hessian full (exact GGN).
+  scalar + kron_ll        : last-layer Kron. RNN only: for the BiRNN it drops the
+                            value offset, so it is refused.
+  layerwise + full        : one prior per param tensor, exact GGN over every
+                            parameter (FuncGGN). Exact but ~1 s per block per
+                            marglik update.
+  layerwise + kron        : RNN only (the BiRNN's frozen scalars misalign the prior).
 
-All three require use_rnn_cell=False so the recurrence is a manual per-timestep
-loop over nn.Linear layers (no nn.RNN).
 
 'kron' uses AsdlGGN, not CurvlinopsGGN: AsdlGGN is ~2.5x faster for our models
 (measured 6.7s vs 16.2s to fit BiRNN's Kron over the full training set) and,
@@ -43,7 +47,7 @@ value_rnn_linear being called once per timestep (149x per forward pass):
      the Laplace object, not just around .fit(), or self.H's block count
      silently drifts out of sync with what the backend actually returns.
      freeze_non_linear_parameters() in laplace_compat.py handles this; those
-     parameters fall back to the scalar/layerwise prior, same as before.
+     parameters are not in the Kron posterior (kept at their MAP values).
 """
 
 import argparse
@@ -51,14 +55,14 @@ import json
 import os
 import time
 import torch
-import pandas as pd
 
 from laplace          import KronLaplace, KronLLLaplace, FullLaplace
-from laplace.curvature import AsdlGGN, CurvlinopsGGN
+from laplace.curvature import AsdlGGN
 
-from hybrid_rnns_pytorch.rnn_config import get_config, get_rnn_config, get_birnn_config
+from hybrid_rnns_pytorch.rnn_config import get_rnn_config, get_birnn_config
 from hybrid_rnns_pytorch import hyb_rnn_utilities
-from hybrid_rnns_pytorch.laplace_compat import laplace_ready, make_dataloader
+from hybrid_rnns_pytorch.laplace_compat import (
+    laplace_ready, make_dataloader, count_valid_samples, FuncGGN)
 from hybrid_rnns_pytorch.marglik_training import marglik_optimization
 from hybrid_rnns_pytorch.bi_rnn import BiRNN
 from hybrid_rnns_pytorch.rnn    import RNN
@@ -78,33 +82,33 @@ def parse_args():
     p.add_argument('--burnin',       type=int,   default=None,
                    help='Epochs before marglik updates start '
                         '(default: 20%% of total epochs).')
-    p.add_argument('--marglik-freq', type=int,   default=1)
+    p.add_argument('--marglik-freq', type=int,   default=1,
+                   help='Epochs between marglik (prior precision) updates.')
+    p.add_argument('--eval-freq',    type=int,   default=1,
+                   help='Epochs between training-set metric evaluations (each costs ~30%% of an epoch).')
     p.add_argument('--n-hypersteps', type=int,   default=100,
                    help='Inner-loop steps on prior precision per marglik update.')
     p.add_argument('--dataset',      type=str,
                    default='hybrid_rnns_pytorch/data/openSourceRawDataset.csv')
+    p.add_argument('--fit-on',       choices=['train', 'trainvalid', 'all'], default='all',
+                   help='Blocks to fit on (paper split). "all" (default) = the whole '
+                        'data, 4,134 blocks: test metrics are in-sample. "train" / '
+                        '"trainvalid" keep the 413 test blocks held out.')
     p.add_argument('--save',         type=str,   default=None,
                    help='Path to save final model weights.')
-    p.add_argument('--seed',         type=int,   default=0,
-                   help='Random seed for model init (default: 0). '
-                        'Seed 42 is the rnn_config default but produces extreme '
-                        'initial BiRNN logits — seed 0 is more stable.')
-    p.add_argument('--backend',      choices=['kron_ll', 'kron', 'full'], default='kron_ll',
+    p.add_argument('--seed',         type=int,   default=42,
+                   help='Random seed for model init (default: 42, as in rnn_config).')
+    p.add_argument('--backend',      choices=['kron_ll', 'kron', 'full'], default='kron',
                    help='Laplace backend. '
-                        '"kron_ll" = KronLLLaplace+AsdlGGN (default, last-layer Kron '
-                        '            -- habit stream only for BiRNN). '
-                        '"kron"    = KronLaplace+AsdlGGN (all Linear layers -- habit '
-                        '            AND value streams for BiRNN, ~2.5x faster than '
-                        '            CurvlinopsGGN. Bare nn.Parameters (BiRNN scalar '
-                        '            init/forget values) are excluded from curvature '
-                        '            and covered by the prior only. '
-                        '"full"    = FullLaplace+CurvlinopsGGN (full Hessian over every '
-                        '            parameter including bare ones; slowest).')
+                        '"kron" (default) = KronLaplace+AsdlGGN over all Linear layers '
+                        '(BiRNN bare scalars excluded, kept at MAP). '
+                        '"kron_ll" = last-layer Kron, RNN only. '
+                        '"full" = FullLaplace + exact GGN (FuncGGN) over every parameter; slow.')
     p.add_argument('--prior-structure', choices=['scalar', 'layerwise', 'diagonal'],
                    default=None,
                    help='Prior structure. Default: "scalar" for kron_ll and kron, '
-                        '"layerwise" for full. '
-                        '"layerwise" gives one prior precision per parameter tensor.')
+                        '"layerwise" for full. "layerwise" gives one prior precision '
+                        'per parameter tensor (with kron: RNN only).')
     p.add_argument('--hidden-size',   type=int, default=None,
                    help='Hidden units per RNN layer. Default: paper-optimal for '
                         '--model (64 for rnn, 32 for birnn) -- only pass this to '
@@ -124,6 +128,8 @@ def _build_model(config):
 
 def main():
     args = parse_args()
+    if min(args.eval_freq, args.marglik_freq) < 1:
+        raise SystemExit('--eval-freq and --marglik-freq must be >= 1')
 
     # Model-specific paper-verified configs (s=True hidden-state feedback for
     # RNN; w_v=1/w_h=1/fit_forget=True/zero_values=True for BiRNN) -- NOT
@@ -151,13 +157,20 @@ def main():
         prior_struct = args.prior_structure or 'scalar'
         if prior_struct != 'scalar':
             raise ValueError('--backend kron_ll only supports --prior-structure scalar')
+        if args.model == 'birnn':
+            raise SystemExit('--backend kron_ll is wrong for birnn: KronLLLaplace fits '
+                             'habit_out_linear(features) without the value offset. Use --backend kron.')
     elif args.backend == 'kron':
         laplace_cls  = KronLaplace
         backend_cls  = AsdlGGN
         prior_struct = args.prior_structure or 'scalar'
+        # log_prior_prec is sized over ALL parameter tensors (BiRNN: 11), the Kron
+        # posterior only over the unfrozen Linear ones (8); Kron has no diagonal prior.
+        if prior_struct == 'diagonal' or (prior_struct == 'layerwise' and args.model == 'birnn'):
+            raise SystemExit(f'--backend kron does not support --prior-structure {prior_struct} for {args.model}')
     else:  # 'full'
         laplace_cls  = FullLaplace
-        backend_cls  = CurvlinopsGGN
+        backend_cls  = FuncGGN          # exact GGN; CurvlinopsGGN is the same matrix, ~8 min/batch
         prior_struct = args.prior_structure or 'layerwise'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -169,21 +182,31 @@ def main():
     print(f'Backend         : {args.backend}  ({laplace_cls.__name__}+{backend_cls.__name__})')
     print(f'Prior structure : {prior_struct}')
 
-    # ---- load ALL data — no train/test split ----
+    # ---- load data and split FIRST (paper split), then pick the fitted blocks ----
+    n_actions = config.network_params.n_actions
     print(f'\nLoading {args.dataset}')
-    hum_dat = pd.read_csv(args.dataset)
+    hum_dat = hyb_rnn_utilities.load_osf_dataframe(args.dataset)   # rewards 0-1
+    tensors = hyb_rnn_utilities.format_data_for_model_training(
+        hum_dat, n_actions=n_actions, split_file=config.split_path)
+    fit_splits = {'train': ('train',), 'trainvalid': ('train', 'valid'),
+                  'all': ('train', 'valid', 'test')}[args.fit_on]
+    fit_dat  = torch.cat([tensors[f'{s}_dat'] for s in fit_splits])
+    test_dat = tensors['test_dat'].to(device)
+    test_held_out = args.fit_on != 'all'
+    if args.fit_on == 'all' and not args.no_debug:
+        print('Note: debug fits a random subset, so "in-sample" test metrics are only partly in-sample.')
 
     if debug:
-        unique_subs = hum_dat['s_id'].unique()[:20]
-        hum_dat = hum_dat[hum_dat['s_id'].isin(unique_subs)]
-        print(f'Debug mode: {len(unique_subs)} participants')
-
-    all_dat = hyb_rnn_utilities.format_all_data(
-        hum_dat, n_actions=config.network_params.n_actions)
-    all_dat = all_dat.to(device)
+        # Random blocks of the fitted splits (fixed generator, so every debug
+        # run fits the same blocks); the test set stays complete.
+        g = torch.Generator().manual_seed(0)
+        fit_dat = fit_dat[torch.randperm(len(fit_dat), generator=g)[:100]]
+        print(f'Debug mode: {len(fit_dat)} random blocks')
+    print(f'Fitting on   : {"+".join(fit_splits)} ({len(fit_dat)} blocks)')
+    fit_dat = fit_dat.to(device)
 
     train_loader = make_dataloader(
-        all_dat,
+        fit_dat,
         n_actions  = config.network_params.n_actions,
         batch_size = args.batch_size,
         shuffle    = True,
@@ -191,24 +214,19 @@ def main():
     print(f'DataLoader: {len(train_loader)} batches/epoch')
 
     # ---- build model and wrap ----
-    # detach_value=False for 'kron'/'full': both are meant to cover the value
-    # stream too (see laplace_compat.py docstring); 'kron_ll' keeps the
-    # last-layer approximation, so the value stream stays detached.
     torch.manual_seed(args.seed)
     model   = _build_model(config).to(device)
+    # Never detach: this wrapper is also the model trained by SGD below.
     wrapped = laplace_ready(model, n_actions=config.network_params.n_actions,
-                             detach_value=(args.backend == 'kron_ll'))
+                             detach_value=False)
 
-    # Materialise any LazyLinear layers before Laplace sees the model
+    # Dry-run forward pass (kept: creating the shuffled iterator advances the global RNG,
+    # so removing it would change the batch order)
     with torch.no_grad():
         dummy_x = next(iter(train_loader))[0].to(device)
         wrapped(dummy_x)
 
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())}')
-
-    # ---- held-out test set (same 80/10/10 participant split as normal training) ----
-    tensors  = hyb_rnn_utilities.format_data_for_model_training(hum_dat)
-    test_dat = tensors['test_dat'].to(device)
 
     # ---- marginal-likelihood training ----
     t0 = time.time()
@@ -225,33 +243,37 @@ def main():
         laplace           = laplace_cls,
         backend           = backend_cls,
         compile_model     = args.compile,
+        eval_frequency    = args.eval_freq,
     )
 
     elapsed = time.time() - t0
 
-    # ---- restore best weights then evaluate on full held-out test set ----
+    # ---- restore best weights then evaluate on the full test set (paper metric) ----
     if best_model_dict is not None:
         wrapped.load_state_dict(best_model_dict)
 
-    n_actions = config.network_params.n_actions
     inner_model = wrapped.model
     inner_model.eval()
     with torch.no_grad():
-        test_input = test_dat[:, :, :n_actions + 1]
-        action_probs_seq, _ = inner_model.unroll(test_input)
-        action_probs_seq = (1 - 1e-5) * action_probs_seq + 5e-4
+        probs, _ = inner_model.unroll(test_dat[:, :, :n_actions + 1])
+        preds    = probs[:, :-1]                          # output t predicts action t+1
+        test_m   = hyb_rnn_utilities.accuracy_metrics(
+            hyb_rnn_utilities.block_nll(preds, test_dat, n_actions), test_dat, n_actions)
         targets  = test_dat[:, 1:, :n_actions]
         mask     = test_dat[:, 1:, n_actions + 1]
-        preds    = action_probs_seq[:, :-1]
-        step_nll = -(torch.log(preds) * targets).sum(dim=-1)
-        n_valid  = mask.sum()
-        test_acc = torch.exp(-(step_nll * mask).sum() / n_valid).item()
-        test_argmax_acc = ((preds.argmax(-1) == targets.argmax(-1)) * mask).sum().item() / n_valid.item()
+        test_argmax_acc = ((preds.argmax(-1) == targets.argmax(-1)) * mask).sum().item() / mask.sum().item()
 
+    test_label = 'held-out' if test_held_out else 'IN-SAMPLE: test blocks were fitted'
     print(f'\n=== Done ===')
     print(f'Training time  : {elapsed:.1f}s ({elapsed/60:.1f} min)')
-    print(f'Best marglik   : {best_marglik:.4f}')
-    print(f'Test acc       : {test_acc*100:.2f}%  (paper target: ~68.3%)')
+    n_fit = count_valid_samples(train_loader)         # fitted choices (missed trials excluded)
+    print(f'Log marginal likelihood ({args.backend}, best epoch): {-best_marglik:.2f}  '
+          f'({-best_marglik / len(fit_dat):.3f}/block, {-best_marglik / n_fit:.5f}/choice)')
+    print(f'Test set ({len(test_dat)} blocks, {test_label}):')
+    print(f"  NLL/block {test_m['nll_per_block']:.2f} | acc_paper {test_m['acc_paper'] * 100:.2f}% "
+          f"| acc_pooled {test_m['acc_pooled'] * 100:.2f}% | argmax {test_argmax_acc * 100:.2f}%")
+    if test_held_out and config.model_name == 'birnn' and config.network_params.hidden_size == 32:
+        print('  Paper Memory-ANN: NLL/block 61.3, acc 68.3%')
     print(f'Prior precision: {best_precision}')
 
     results = {
@@ -263,19 +285,32 @@ def main():
         'lr':               args.lr,
         'lr_hyp':           args.lr_hyp,
         'seed':             args.seed,
-        'best_marglik':     round(best_marglik, 4),
+        'debug':            debug,
+        'fit_on':           args.fit_on,
+        'n_fit_blocks':     len(fit_dat),
+        'test_held_out':    test_held_out,
+        # -log evidence (backend approximation); None if no marglik epoch ran
+        'neg_log_marglik':  round(best_marglik, 4) if best_model_dict is not None else None,
+        'n_fit_choices':    n_fit,
         'best_precision':   best_precision.tolist() if best_precision is not None else None,
-        'test_acc':         round(test_acc, 4),
-        'test_argmax_acc':  round(test_argmax_acc, 4),
+        # v2: acc_paper = mean over blocks of exp(-NLL/150); acc_pooled = old formula
+        'metric_version':     2,
+        'test_nll_per_block': round(test_m['nll_per_block'], 4),
+        'test_acc_paper':     round(test_m['acc_paper'], 4),
+        'test_acc_pooled':    round(test_m['acc_pooled'], 4),
+        'test_argmax_acc':    round(test_argmax_acc, 4),
         'training_time_s':  round(elapsed, 1),
     }
+    run_name = (f'{args.model}_marglik_be={args.backend}_e={n_epochs}'
+                f'_hs={config.network_params.hidden_size}_fit={args.fit_on}_seed={args.seed}_v2')
     os.makedirs('results', exist_ok=True)
-    results_path = f'results/{args.model}_marglik_be={args.backend}_e={n_epochs}_hs={config.network_params.hidden_size}.json'
+    results_path = f'results/{run_name}.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {results_path}')
 
-    save_path = args.save or f'trained_models/{args.model}_marglik_be={args.backend}_e={n_epochs}_hs={config.network_params.hidden_size}.pt'
+    save_path = args.save or f'trained_models/{run_name}.pt'
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     torch.save(model.state_dict(), save_path)
     print(f'Weights saved to {save_path}')
 

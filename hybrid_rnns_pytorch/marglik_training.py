@@ -4,12 +4,12 @@ Adapted from model_recovery/marglik.py (Immer et al. style marglik training).
 Fits a Laplace posterior (last-layer, all-Linear-Kron, or full) while jointly
 optimising the prior precision via marginal likelihood.
 
-This is appropriate here because our RNN/BiRNN models are small (~2,500
-params for the paper-optimal BiRNN), so even the full Hessian is cheap.
-
-Note: requires use_rnn_cell=False in NetworkParams so that all layers are
-nn.Linear -- Kron-structured backends only Kronecker-factor nn.Linear/Conv,
-not nn.RNN.
+The default is all-Linear Kron (KronLaplace + AsdlGGN). Kron is a cheap
+approximation that is fine for choosing the prior precision during training,
+but its evidence is biased for the weight-shared recurrent layers (off by ~2k
+nats for the BiRNN), so report the evidence from an exact GGN post hoc
+(run_laplace.py --hessian full). Last-layer Laplace (KronLLLaplace) is only
+valid for the RNN: for the BiRNN it drops the value offset (see laplace_compat).
 
 `laplace=KronLaplace` (all Linear layers, both habit and value streams) works
 fine with `backend=AsdlGGN` -- and is ~2.5x faster than CurvlinopsGGN for
@@ -29,11 +29,12 @@ these models (6.7s vs 16.2s to fit BiRNN's Kron over the full training set)
   2. Bare nn.Parameters (BiRNN's scalar init/forget values) still can't be
      Kron-factored by ASDL (it only walks nn.Linear/nn.Conv modules), so
      they're excluded from curvature via freeze_non_linear_parameters()
-     below and left to the scalar/layerwise prior -- see laplace_compat.py.
+     below: they are not part of the Kron posterior (kept at their MAP
+     values) and only the SGD L2 term sees them -- see laplace_compat.py.
 
-CurvlinopsGGN remains available as a slower fallback (e.g. if a future
-PyTorch release removes the non-full backward hook ASDL currently warns
-about deprecating).
+CurvlinopsGGN is NOT a usable fallback for Kron: with missed-trial rows dropped,
+the number of rows per batch is not a multiple of the number of blocks, which
+curvlinops' KFAC requires.
 
 N (dataset size) bug: laplace-torch computes `N = len(train_loader.dataset)`
 and uses it to normalise both the Kron-fit's implicit evidence-vs-complexity
@@ -43,14 +44,10 @@ expecting N to count the same thing `M = len(y)` counts per batch, i.e.
 `SequenceDataset.__len__()` must return the number of BLOCKS for DataLoader
 indexing to work, so `len(train_loader.dataset)` under-counts the true
 sample size by ~n_trials (~149x here). Left uncorrected, this makes the
-marglik-optimal prior precision come out ~149x too concentrated on
-regularisation relative to fit, which visibly destabilises training once
-burn-in ends (loss jumps up and never fully recovers even after thousands of
-further epochs) rather than settling into a value that actually improves
-held-out accuracy the way marginal-likelihood optimisation is supposed to.
-Both this file's explicit prior term and the periodic `lap.fit(train_loader)`
-call use the corrected N (see count_valid_samples/fit_kron_with_correct_N in
-laplace_compat.py) so the whole pipeline is internally consistent.
+explicit prior term below ~149x too strong, which visibly destabilises
+training once burn-in ends. Both this file's prior term and the periodic Kron
+fit use the corrected N (count_valid_samples; fit_kron_with_correct_N rescales
+only the Kron input factors, not the bias blocks).
 """
 
 from contextlib import nullcontext
@@ -65,8 +62,10 @@ from torch.nn.utils import parameters_to_vector
 from laplace import KronLaplace, KronLLLaplace, FullLaplace
 from laplace.curvature import AsdlGGN, CurvlinopsGGN
 
+from . import hyb_rnn_utilities
 from .laplace_compat import (
     freeze_non_linear_parameters, count_valid_samples, fit_kron_with_correct_N,
+    rows_to_blocks,
 )
 
 try:
@@ -101,9 +100,10 @@ def marglik_optimization(
     n_hypersteps=100,
     marglik_frequency=1,
     lr_hyp=1e-1,
-    laplace=KronLLLaplace,
+    laplace=KronLaplace,
     backend=AsdlGGN,
     compile_model=False,
+    eval_frequency=1,
 ):
     """Joint optimisation of model weights and prior precision via marginal likelihood.
 
@@ -113,7 +113,9 @@ def marglik_optimization(
         The wrapped sequence model (SequenceModelWrapper). Its forward(x)
         must return raw logits of shape (N, n_classes).
     train_loader : DataLoader
-        Yields (x, y) batches over ALL available data (no train/test split).
+        From make_dataloader(): yields (x, y) batches over the data the
+        posterior is fitted on (run_laplace_training.py: train+valid blocks by
+        default, --fit-on all adds test). No validation set is needed.
     prior_structure : str
         'scalar' (default), 'layerwise', or 'diagonal'.
         'scalar' is recommended: KronLLLaplace has one Kron block (the last
@@ -139,11 +141,11 @@ def marglik_optimization(
         requires the model to be wrapped with detach_value=False). Bare
         nn.Parameters are still excluded from curvature and covered only by
         the scalar/layerwise prior via the training loop's L2 term.
-        Pass FullLaplace + backend=CurvlinopsGGN for the full (non-Kron)
+        Pass FullLaplace + backend=laplace_compat.FuncGGN for the full (non-Kron)
         Hessian over every parameter, bare ones included.
     backend : curvature backend
-        Default: AsdlGGN. Use CurvlinopsGGN with `laplace=FullLaplace`, or as
-        a slower fallback for `laplace=KronLaplace` (see module docstring).
+        Default: AsdlGGN. Use laplace_compat.FuncGGN with `laplace=FullLaplace`
+        (exact GGN; CurvlinopsGGN gives the same matrix far more slowly).
     compile_model : bool
         torch.compile() the plain SGD training/eval forward pass only. Does
         NOT touch the forward calls Laplace/ASDL/Curvlinops make internally
@@ -155,6 +157,9 @@ def marglik_optimization(
         SequenceModelWrapper) is exactly the kind of many-tiny-ops pattern
         torch.compile targets, so this is worth trying for the SGD passes,
         which dominate wall time when marglik_frequency > 1.
+    eval_frequency : int
+        Evaluate the training-set metrics every this many epochs (and on every
+        marglik epoch and the last one). Default 1 = every epoch.
 
     Returns
     -------
@@ -163,7 +168,7 @@ def marglik_optimization(
     best_precision : Tensor
         Prior precision at the best epoch.
     best_marglik : float
-        Best (lowest) marginal likelihood value seen during training.
+        Best (lowest) NEGATIVE log marginal likelihood seen during training.
     """
     device = parameters_to_vector(model.parameters()).device
     if device.type == 'cpu':
@@ -232,19 +237,23 @@ def marglik_optimization(
             theta      = parameters_to_vector(model.parameters())
             delta      = expand_prior_precision(prior_prec, model)
 
+            # Missed targets are already dropped from both f and y (see
+            # SequenceModelWrapper / make_dataloader in laplace_compat.py).
             f    = forward_fn(X)
-            # Missed trials get an arbitrary y=argmax(all-zero)=0 label from
-            # SequenceDataset -- must exclude them from the likelihood term or
-            # the model is trained to predict class 0 on every missed trial.
-            # Matches fit_hyb_rnn.py's loss_fn, which masks the same way.
-            mask = X[:, 1:, -1].reshape(-1).bool()
-            loss = criterion(f[mask], y[mask]) + (0.5 * (delta * theta) @ theta) / N
+            loss = criterion(f, y) + (0.5 * (delta * theta) @ theta) / N
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.detach().cpu().item() / len(train_loader)
 
         t_train = time.perf_counter()
+
+        # Only every eval_frequency epochs (and on marglik epochs): a full pass
+        # costs ~30% of an epoch. The next epoch starts in train mode again.
+        do_marglik = epoch >= n_epochs_burnin and epoch % marglik_frequency == 0
+        if not (do_marglik or epoch % eval_frequency == 0 or epoch == n_epochs):
+            losses.append(epoch_loss)
+            continue
 
         # ---- eval-mode metrics -------------------------------------------------
         # For schedulefree Adam, training-mode params are the momentum interpolant
@@ -254,33 +263,39 @@ def marglik_optimization(
         if _HAS_SCHEDULEFREE:
             optimizer.eval()
 
-        nll_sum, n_correct, n_valid = 0.0, 0, 0
+        # Monitoring on the TRAINING data (not held out): paper formula
+        # (smoothed NLL per block, mean_b exp(-NLL_b/150)) plus argmax accuracy.
+        nll_blocks, n_correct, n_valid = [], 0, 0
         with torch.no_grad():
             for X, y in train_loader:
                 X, y = X.to(device), y.to(device)
                 f    = forward_fn(X)
-                mask = X[:, 1:, -1].reshape(-1).bool()
-                f_v, y_v = f[mask], y[mask]
-                nll_sum  += F.cross_entropy(f_v, y_v, reduction='sum').item()
-                n_correct += (torch.argmax(f_v, dim=-1) == y_v).sum().item()
-                n_valid   += mask.sum().item()
+                n_actions = f.shape[-1]
+                probs = rows_to_blocks(F.softmax(f, dim=-1), X, n_actions)
+                nll_blocks.append(hyb_rnn_utilities.block_nll(probs, X, n_actions))
+                n_correct += (torch.argmax(f, dim=-1) == y).sum().item()
+                n_valid   += len(y)
 
         t_eval = time.perf_counter()
 
-        paper_acc  = np.exp(-nll_sum / n_valid)
-        argmax_acc = n_correct / n_valid
+        train_m = hyb_rnn_utilities.accuracy_metrics(
+            torch.cat(nll_blocks), train_loader.dataset.tensor, n_actions)
+        train_nll_per_block = train_m['nll_per_block']
+        train_acc           = train_m['acc_paper']
+        train_argmax_acc    = n_correct / n_valid
         losses.append(epoch_loss)
         epoch_secs   = t_eval - t_epoch
         elapsed_secs = t_eval - t_total
         print(f'MARGLIK[epoch={epoch}/{n_epochs}]: '
-              f'loss={losses[-1]:.3f}  acc={paper_acc:.4f}  argmax_acc={argmax_acc:.4f}  '
+              f'loss={losses[-1]:.3f}  train_nll_per_block={train_nll_per_block:.2f}  '
+              f'train_acc={train_acc:.4f}  train_argmax_acc={train_argmax_acc:.4f}  '
               f'| train={t_train-t_epoch:.1f}s  eval={t_eval-t_train:.1f}s  epoch={epoch_secs:.1f}s  '
               f'elapsed={elapsed_secs:.0f}s ({elapsed_secs/60:.1f}min)',
               flush=True)
 
         # ---- marglik hyperparameter update ----
         # model is already in eval mode (and optimizer in eval mode if schedulefree)
-        if epoch < n_epochs_burnin or (epoch % marglik_frequency) != 0:
+        if not do_marglik:
             # restore training mode for next epoch
             model.train()
             if _HAS_SCHEDULEFREE:
@@ -304,7 +319,10 @@ def marglik_optimization(
             if needs_linear_only:
                 fit_kron_with_correct_N(lap, train_loader)
             else:
-                lap.fit(train_loader)
+                # Full GGN (FuncGGN) holds per-block Jacobians: ~0.5 GB per block in a
+                # batch, so fit on 4-block batches, not the SGD batch size.
+                lap.fit(torch.utils.data.DataLoader(
+                    train_loader.dataset, batch_size=4, collate_fn=train_loader.collate_fn))
 
             for _ in range(n_hypersteps):
                 hyper_optimizer.zero_grad()
@@ -334,5 +352,7 @@ def marglik_optimization(
         if _HAS_SCHEDULEFREE:
             optimizer.train()
 
+    if _HAS_SCHEDULEFREE:
+        optimizer.eval()   # leave the weights at the schedule-free iterate, not the interpolant
     print('MARGLIK: training complete.')
     return best_model_dict, best_precision, best_marglik

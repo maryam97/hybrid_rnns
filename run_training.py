@@ -27,31 +27,33 @@ import os
 import time
 import torch
 from hybrid_rnns_pytorch.fit_hyb_rnn import train
-from hybrid_rnns_pytorch.rnn_config import get_config, get_rnn_config, get_birnn_config
+from hybrid_rnns_pytorch.rnn_config import Config, get_rnn_config, get_birnn_config
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a hybrid RNN reward-learning model.')
     parser.add_argument('--model', choices=['cogmod', 'rnn', 'birnn'], default=None,
-                        help='Model to train. "birnn" uses the paper-optimal config '
+                        help='Model to train. "birnn" uses the paper Memory-ANN config '
                              '(s=True, zero_values=True, w_v=1, w_h=1, fit_forget=True, '
-                             'hidden_size=16) unless overridden by other flags.')
+                             'hidden_size=32) unless overridden by other flags.')
     parser.add_argument('--no-debug', action='store_true',
-                        help='Run full training (1M steps, batch=32) instead of debug mode.')
+                        help='Run full training (1M steps; batch 128 birnn, 64 rnn, 32 cogmod) '
+                             'instead of debug mode (100 steps, batch 2).')
     parser.add_argument('--dataset', type=str, default=None,
                         help='Path to dataset CSV (overrides config default).')
     parser.add_argument('--lr', type=float, default=None,
                         help='Learning rate (default: 1e-4).')
     parser.add_argument('--hidden-size', type=int, default=None,
-                        help='Hidden units per RNN layer. Default: 16 for birnn, 64 for rnn.')
+                        help='Hidden units per RNN layer. Default: 32 for birnn, 64 for rnn.')
     parser.add_argument('--weight-decay', type=float, default=None,
                         help='AdamW weight decay (default: 1e-5).')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='Training batch size. Default: 64 for rnn, 128 for birnn (paper Table 1).')
+                        help='Training batch size. Default: 2 (debug); with --no-debug 128 birnn, 64 rnn, 32 cogmod.')
     parser.add_argument('--steps', type=int, default=None,
-                        help='Number of training steps (default: 1M).')
+                        help='Number of training steps (default: 100 debug, 1M with --no-debug).')
     parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for model init and batch sampling (default: 42).')
+                        help='Random seed for model init and batch sampling (default: 42). '
+                             'The train/valid/test split does not depend on it.')
     parser.add_argument('--save', action='store_true',
                         help='Whether to save the trained model weights.')
     parser.add_argument('--compile', action='store_true',
@@ -65,19 +67,15 @@ def main():
     args = parse_args()
 
     # Use paper-verified configs by default; CLI flags override on top
+    # debug=False -> 1M steps and the paper batch sizes (Table 1)
     if args.model == 'birnn':
-        config = get_birnn_config()
+        config = get_birnn_config(debug=not args.no_debug)
     elif args.model == 'rnn':
-        config = get_rnn_config()
+        config = get_rnn_config(debug=not args.no_debug)
     else:
-        config = get_config()
+        config = Config(debug=not args.no_debug)
         if args.model is not None:
             config.model_name = args.model
-    if args.no_debug:
-        config.debug = False
-        config.n_training_steps = int(1e6)
-        # paper batch sizes (Table 1): rnn=64, birnn(Memory-ANN)=128
-        config.batch_size = 64 if args.model == 'rnn' else 128
     if args.dataset is not None:
         config.dataset_path = args.dataset
     if args.lr is not None:
@@ -118,18 +116,23 @@ def main():
         'weight_decay':    config.weight_decay,
         'batch_size':      config.batch_size,
         'debug':           config.debug,
+        'split':           (os.path.basename(config.split_path)
+                            if config.split_path and os.path.exists(config.split_path) else 'file-order rule'),
+        # v2: acc_paper = mean over blocks of exp(-NLL/150); acc_pooled = old formula
+        'metric_version':  2,
         'training_time_s': round(elapsed, 1),
         **scalars,
     }
     os.makedirs('results', exist_ok=True)
-    results_path = f'results/{config.model_name}_hs={config.network_params.hidden_size}_s={scalars["step"]}_seed={config.random_seed}.json'
+    results_path = f'results/{config.model_name}_hs={config.network_params.hidden_size}_steps={config.n_training_steps}_seed={config.random_seed}_v2.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {results_path}')
 
     if args.save:
         os.makedirs('trained_models', exist_ok=True)
-        save_path = f'trained_models/{args.model}_hs={config.network_params.hidden_size}_e={scalars["step"]}_seed={config.random_seed}_pred.pt'
+        # best checkpoint on validation NLL (see fit_hyb_rnn.train)
+        save_path = f'trained_models/{config.model_name}_hs={config.network_params.hidden_size}_steps={config.n_training_steps}_seed={config.random_seed}_v2.pt'
         torch.save(model.state_dict(), save_path)
         print(f'Weights saved to {save_path}')
 

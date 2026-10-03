@@ -3,6 +3,7 @@
 A bifurcating RNN with separate 'habit' and 'value' modules.
 """
 
+import math
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -74,7 +75,8 @@ class BiRNN(nn.Module):
             self._fit_init_h_state = False
 
         if rl_params['fit_forget']:
-            self._raw_forget = nn.Parameter(torch.zeros(1))  # sigmoid(0) = 0.5
+            # haiku: unsigmoid_forget ~ RandomNormal(mean=0, stddev=1)
+            self._raw_forget = nn.Parameter(torch.empty(1).normal_(0, 1))
             self._fit_forget = True
         else:
             self.register_buffer('_fixed_forget',
@@ -103,15 +105,17 @@ class BiRNN(nn.Module):
         if self._hs:
             h_in += self._hidden_size
 
-        if self._use_rnn_cell and not self._ho and not self._hs:
-            # Fast path: nn.RNN processes the full action sequence in one call.
-            self.habit_rnn_cell = nn.RNN(
-                self._n_actions, self._hidden_size,
-                batch_first=True, nonlinearity='tanh',
-            )
-        else:
-            self.habit_rnn_linear = nn.Linear(h_in, self._hidden_size)
+        # Same layer for both code paths. Without s/o the habit RNN has no
+        # recurrence, so the fast path applies it to the whole sequence at once.
+        self.habit_rnn_linear = nn.Linear(h_in, self._hidden_size)
         self.habit_out_linear = nn.Linear(self._hidden_size, self._n_actions)
+
+        # hk.Linear default init: truncated normal (+-2 std), std = 1/sqrt(fan_in); zero bias
+        for lin in (self.value_rnn_linear, self.value_out_linear,
+                    self.habit_rnn_linear, self.habit_out_linear):
+            std = 1.0 / math.sqrt(lin.in_features)
+            nn.init.trunc_normal_(lin.weight, std=std, a=-2 * std, b=2 * std)
+            nn.init.zeros_(lin.bias)
 
     # ------------------------------------------------------------------
     # Properties
@@ -228,15 +232,13 @@ class BiRNN(nn.Module):
             else self.initial_state(batch_size, device)
 
         if self._use_rnn_cell and not self._ho and not self._hs:
-            # ---- fast path: habit runs as a single nn.RNN call ----
-            # Value still needs a loop (custom forgetting + Q-update each step).
+            # ---- fast path (s=o=False): habit has no recurrence, so it is
+            # tanh(W a_t + b) for every t at once. Value still needs a loop.
             h_state, v_state, habit, value = state
 
-            actions = input_seq[:, :, :self._n_actions]   # (batch, time, n_actions)
-            h0 = h_state.unsqueeze(0)                      # (1, batch, hidden)
-            habit_hiddens, final_h = self.habit_rnn_cell(actions, h0)
-            # habit_hiddens: (batch, time, hidden)
-            all_habits = self.habit_out_linear(habit_hiddens)  # (batch, time, n_actions)
+            actions = input_seq[:, :, :self._n_actions]                 # (batch, time, n_actions)
+            habit_hiddens = torch.tanh(self.habit_rnn_linear(actions))  # (batch, time, hidden)
+            all_habits = self.habit_out_linear(habit_hiddens)           # (batch, time, n_actions)
 
             outputs = []
             for t in range(input_seq.size(1)):
@@ -252,7 +254,7 @@ class BiRNN(nn.Module):
                 value = next_value
                 habit = next_habit
 
-            final_state = (final_h.squeeze(0), v_state, habit, value)
+            final_state = (habit_hiddens[:, -1], v_state, habit, value)
             return torch.stack(outputs, dim=1), final_state
 
         else:

@@ -3,22 +3,41 @@
 Uses a plain dataclass instead of ml_collections.ConfigDict.
 """
 
+import os
 from dataclasses import dataclass, field
 import torch.nn.functional as F
 
+# The author's split file (re-exported by hyb_rnn_utilities).
+DEFAULT_SPLIT_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'splits', 'open_source_mapping.csv')
+
+
+class _StrictFields:
+    """Reject attributes that are not dataclass fields.
+
+    Prevents silent no-ops such as `config.hidden_size = 32`: the model reads
+    `config.network_params.hidden_size`.
+    """
+
+    def __setattr__(self, name, value):
+        if name not in self.__dataclass_fields__:
+            raise AttributeError(f'{type(self).__name__} has no field {name!r}; '
+                                 f'valid fields: {sorted(self.__dataclass_fields__)}')
+        object.__setattr__(self, name, value)
+
 
 @dataclass
-class NetworkParams:
+class NetworkParams(_StrictFields):
     n_actions:            int    = 4
     hidden_size:          int    = 64
     final_activation_fn:  object = field(
         default_factory=lambda: (lambda x: F.softmax(x, dim=-1))
     )
-    use_rnn_cell:         bool   = False #True  # use nn.RNN instead of manual loop
+    use_rnn_cell:         bool   = False  # s=o=False only: vectorised unroll, same result as the loop
 
 
 @dataclass
-class RLParams:
+class RLParams(_StrictFields):
     # Flags: which parameters are fitted?
     fit_alpha:        bool = True
     fit_beta:         bool = False
@@ -60,11 +79,13 @@ class RLParams:
 
 
 @dataclass
-class Config:
+class Config(_StrictFields):
     debug: bool = True
 
-    random_seed:  int = 1356  # gives exact paper block counts: train=3302, valid=419, test=413
+    random_seed:  int = 42    # model init + batch order (upstream default); does not affect the split
     dataset_path: str = 'hybrid_rnns_pytorch/data/openSourceRawDataset.csv' #smallExampleDataset
+    # Paper split (3302/419/413 blocks). None -> the same split rebuilt from CSV row order.
+    split_path:   str | None = DEFAULT_SPLIT_FILE
 
     n_trials:   int = 150
     n_datasets: int = 3520 + 388
@@ -94,14 +115,16 @@ def get_config() -> Config:
     return Config()
 
 
-def get_rnn_config() -> Config:
+def get_rnn_config(debug: bool = True) -> Config:
     """Vanilla RNN config from the paper (Table 1).
 
     Confirmed by parameter count: hidden_size=64 + s=True → 4,740 params exactly.
     Without s=True the model has only 644 params and performs much worse.
     Paper also uses batch_size=64 (not 32) for the RNN.
     """
-    config = Config()
+    config = Config(debug=debug)
+    if not debug:
+        config.batch_size = 64    # paper Table 1 (vanilla RNN)
     config.model_name = 'rnn'
     config.network_params.hidden_size = 64
     config.rnn_rl_params.s = True   # hidden-state feedback — REQUIRED for 4,740 params
@@ -109,7 +132,7 @@ def get_rnn_config() -> Config:
     return config
 
 
-def get_birnn_config() -> Config:
+def get_birnn_config(debug: bool = True) -> Config:
     """Winning hybRNN config — "Memory-ANN" from paper Table 1.
 
     Paper Table 1 (Memory-ANN): hidden_size=32, batch_size=128, n_params=2,472,
@@ -122,7 +145,9 @@ def get_birnn_config() -> Config:
       fit_init_v, fit_init_h, fit_forget: 3
       Total: 2,472  ✓
     """
-    config = Config()
+    config = Config(debug=debug)
+    if not debug:
+        config.batch_size = 128   # paper Table 1 (Memory-ANN)
     config.model_name = 'birnn'
     config.network_params.hidden_size = 32
     config.rnn_rl_params.w_v          = 1.0

@@ -9,44 +9,47 @@ Because our models are sequence models, the wrapper:
   1. Accepts x of shape (batch, n_trials, n_actions+2) — includes valid-mask column
   2. Strips the mask column before passing to the model backbone
   3. Unrolls the backbone to collect hidden-state features for t=0..T-2
-  4. Calls the last linear ONCE with a 2D tensor (batch*(T-1), hidden) so
+  4. Drops the rows whose target (trial t+1) is a missed trial, so they never
+     enter the Laplace fit / marginal likelihood (make_dataloader drops the
+     same rows from y, keeping logits and labels aligned)
+  5. Calls the last linear ONCE with a 2D tensor (n_valid, hidden) so
      Laplace's feature hook captures the full set of predictions in one shot
-  5. Returns raw logits (batch*(T-1), n_actions) — no softmax
+  6. Returns raw logits (n_valid, n_actions) — no softmax. rows_to_blocks()
+     maps them back to (batch, T-1, n_actions) for per-block metrics
 
-BiRNN note: by default (detach_value=True) last-layer Laplace is applied to
-habit_out_linear only, and the value stream is treated as a fixed offset
-(detached from the gradient graph) -- this is the last-layer approximation.
+BiRNN and last-layer Laplace: laplace-torch's last-layer machinery (LLLaplace,
+KronLLLaplace, ASDL's last-layer Kron) recomputes the logits as
+last_layer(features) = habit_out_linear(features), which drops the BiRNN value
+offset. Loss, curvature, evidence and predictive are then those of a habit-only
+model, so last-layer Laplace is refused for the BiRNN in both scripts. RNN is fine.
 
-For any Laplace fit that is supposed to cover MORE than the last layer
-(subset_of_weights='all', or hessian_structure='kron'/'full' over the whole
-model), the wrapper must be built with detach_value=False, otherwise
-value_rnn_linear / value_out_linear (and any bare nn.Parameter that only
-feeds the value stream, e.g. BiRNN's _raw_init_value_v/h, _raw_forget) get
-ZERO curvature silently -- Curvlinops' Jacobian-based backends don't error on
-unused parameters, they just report a zero block, so this bug is easy to
-miss. See freeze_non_linear_parameters() below for the companion fix needed
-for Kron-structured (KFAC) fits, which additionally require every parameter
-handed to them to live inside a supported layer (nn.Linear/nn.Conv).
+Keep detach_value=False (the default). A detached value stream gives
+value_rnn_linear / value_out_linear no gradient: ASDL Kron then raises
+`TypeError: 'float' * NoneType`, Curvlinops Kron raises, and full-GGN backends
+silently return a zero block. In marglik training the wrapper is also the model
+trained by SGD, so detaching would stop the value stream from learning at all.
+See freeze_non_linear_parameters() below for the companion fix needed for
+Kron-structured (KFAC) fits, which require every parameter handed to them to
+live inside a supported layer (nn.Linear/nn.Conv).
 
 Usage
 -----
     from hybrid_rnns_pytorch.laplace_compat import laplace_ready, make_dataloader
     from laplace import Laplace
 
-    wrapped     = laplace_ready(trained_birnn)
-    train_loader = make_dataloader(train_dat)
+    wrapped      = laplace_ready(trained_birnn)
+    train_loader = make_dataloader(all_dat, batch_size=4)
 
     la = Laplace(wrapped, likelihood='classification',
-                 subset_of_weights='last_layer',
-                 hessian_structure='kron')   # 'kron', not 'kfac'
+                 subset_of_weights='all', hessian_structure='full',
+                 backend=FuncGGN)            # exact GGN; see run_laplace.py
     la.fit(train_loader)
-    la.optimize_prior_precision(method='marglik', pred_type='glm',
-                                link_approx='probit')
+    la.optimize_prior_precision(method='marglik')
 
-    # Predictive (returns class probabilities)
-    probs = la(x_test, pred_type='glm', link_approx='probit')
-    # Predictive samples
-    samples = la.predictive_samples(x_test, pred_type='glm', n_samples=100)
+    # Predictive (class probabilities). Use the GLM predictive with MC: 'nn'
+    # samples weights through the 149-step recurrence and is far worse than
+    # MAP; 'probit' ignores the softmax-shift correlation and over-disperses.
+    probs = la(x_test, pred_type='glm', link_approx='mc', n_samples=200)
 """
 
 from __future__ import annotations
@@ -57,9 +60,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from laplace.curvature import CurvlinopsGGN
+from laplace.curvature.curvature import GGNInterface
+
 from .rnn    import RNN
 from .bi_rnn import BiRNN
 from .cogmod import CogMod
+
+
+class FuncGGN(CurvlinopsGGN):
+    """Exact GGN (sum_n J_n^T Lambda_n J_n) from torch.func Jacobians.
+
+    laplace-torch's own GGNInterface.full instead of CurvlinopsGGN.full, which
+    builds the same matrix from P GGN-vector products through the 149-step
+    recurrence (~8 min per batch here). Use with small loader batches (2-4 blocks).
+    """
+
+    def full(self, x, y, **kwargs):
+        kwargs.pop('N', None)
+        return GGNInterface.full(self, x, y, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +92,10 @@ class SequenceDataset(torch.utils.data.Dataset):
         x : (n_trials, n_actions+2)   — full sequence including valid-mask column
         y : (n_trials-1,)             — action class indices at t+1
 
-    Missed trials (valid == 0) are kept in y as class 0 (the clipped index) --
-    this is an arbitrary placeholder, NOT a real label. Callers MUST mask
-    using the valid-mask column (x[:, 1:, -1]) before computing any loss or
-    metric from y, or the model/evaluation will be trained/scored against
-    this placeholder as if it were a real target on every missed trial.
+    Missed trials (valid == 0) get class 0 here (argmax of an all-zero row) --
+    an arbitrary placeholder, NOT a real label. make_dataloader's collate_fn
+    drops these entries (and SequenceModelWrapper drops the matching logits),
+    so use this dataset through make_dataloader, not a default collate.
     """
 
     def __init__(self, tensor: torch.Tensor, n_actions: int = 4):
@@ -93,6 +111,22 @@ class SequenceDataset(torch.utils.data.Dataset):
         return seq, y
 
 
+def valid_targets(x: torch.Tensor, n_actions: int = 4) -> torch.Tensor:
+    """(batch*(n_trials-1),) bool: True where the target trial t+1 was not missed."""
+    return x[:, 1:, n_actions + 1].reshape(-1) > 0
+
+
+def rows_to_blocks(rows: torch.Tensor, x: torch.Tensor, n_actions: int = 4) -> torch.Tensor:
+    """Put the wrapper's (n_valid, C) rows back on the (batch, n_trials-1, C) grid.
+
+    Missed-target positions are filled with 0. Their targets are all-zero, so
+    hyb_rnn_utilities.block_nll gives them NLL 0 regardless of the fill value.
+    """
+    out = rows.new_zeros(x.shape[0] * (x.shape[1] - 1), rows.shape[-1])
+    out[valid_targets(x, n_actions)] = rows
+    return out.view(x.shape[0], x.shape[1] - 1, rows.shape[-1])
+
+
 # ---------------------------------------------------------------------------
 # Main wrapper
 # ---------------------------------------------------------------------------
@@ -101,15 +135,16 @@ class SequenceModelWrapper(nn.Module):
     """Wraps RNN/BiRNN so Laplace sees a standard forward(x) -> logits API.
 
     forward(x) where x is (batch, n_trials, n_actions+2) returns raw logits
-    of shape (batch*(n_trials-1), n_actions) — one prediction per timestep.
+    of shape (n_valid, n_actions) — one prediction per timestep whose target
+    (trial t+1) was not missed, in (block, timestep) order.
 
     The last linear layer (output_linear for RNN, habit_out_linear for BiRNN)
     is called exactly ONCE per forward pass with a 2D input tensor so that
-    Laplace's feature hook captures the complete (batch*(T-1), hidden) matrix.
+    Laplace's feature hook captures the complete (n_valid, hidden) matrix.
     """
 
     def __init__(self, model: RNN | BiRNN, n_actions: int, n_trials: int,
-                 detach_value: bool = True):
+                 detach_value: bool = False):
         super().__init__()
 
         if isinstance(model, CogMod):
@@ -137,105 +172,89 @@ class SequenceModelWrapper(nn.Module):
             x: (batch, n_trials, n_actions+2)  — includes valid-mask column
 
         Returns:
-            logits: (batch*(n_trials-1), n_actions)  — raw pre-softmax logits
+            logits: (n_valid, n_actions)  — raw pre-softmax logits, missed
+                    targets dropped (same rows as make_dataloader's y)
         """
         # Strip the valid-mask column; models expect (n_actions+1) features
         x_model = x[:, :, :self.n_actions + 1]   # (batch, n_trials, n_actions+1)
+        keep    = valid_targets(x, self.n_actions)
 
         if isinstance(self.model, RNN):
-            return self._forward_rnn(x_model)
+            return self._forward_rnn(x_model, keep)
         else:
-            return self._forward_birnn(x_model)
+            return self._forward_birnn(x_model, keep)
 
     # ------------------------------------------------------------------
+    # Both models always take the manual loop below: their use_rnn_cell fast
+    # paths (s=o=False) compute the same thing with the same nn.Linear layers.
 
-    def _forward_rnn(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_rnn(self, x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
         """RNN: collect hidden states for t=0..T-2, then call output_linear once."""
         batch, time, _ = x.shape
         model = self.model
 
-        if hasattr(model, 'rnn_cell'):
-            # Fast path: single nn.RNN call gives all hidden states at once.
-            h0 = torch.zeros(1, batch, model._hidden_size, device=x.device)
-            hidden_seq, _ = model.rnn_cell(x, h0)          # (batch, time, hidden)
-            # Hidden at t predicts action at t+1, so take t=0..T-2
-            features = hidden_seq[:, :-1].contiguous().view(-1, model._hidden_size)
-        else:
-            # Slow path: manual loop to collect hidden states.
-            state   = model.initial_state(batch, x.device)
-            hiddens = []
-            for t in range(time - 1):
-                _, state = model.forward(x[:, t], state)
-                hiddens.append(state[1])               # state = (gist, hidden)
-            features = torch.stack(hiddens, dim=1).contiguous().view(-1, model._hidden_size)
+        gist, h = model.initial_state(batch, x.device)
+        hiddens = []
+        for t in range(time - 1):
+            # RNN.forward's recurrence WITHOUT its per-step output_linear call:
+            # every extra head call adds its input to the head's Kron A factor.
+            inp = x[:, t]
+            if model._o: inp = torch.cat([inp, gist], dim=-1)
+            if model._s: inp = torch.cat([inp, h], dim=-1)
+            h = torch.tanh(model.rnn_linear(inp))
+            if model._o:
+                gist = model.output_linear(h)      # only needed as next input
+            hiddens.append(h)
+        features = torch.stack(hiddens, dim=1).contiguous().view(-1, model._hidden_size)
 
         # output_linear called ONCE with 2D input — Laplace hooks here
-        logits = model.output_linear(features)         # (batch*(time-1), n_actions)
+        logits = model.output_linear(features[keep])   # (n_valid, n_actions)
         return logits
 
     # ------------------------------------------------------------------
 
-    def _forward_birnn(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_birnn(self, x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
         """BiRNN: collect habit hidden states + value offsets, call habit_out_linear once."""
         batch, time, _ = x.shape
         model = self.model
 
-        if hasattr(model, 'habit_rnn_cell') and not model._ho and not model._hs:
-            # Fast path: habit stream uses nn.RNN.
-            h_state, v_state, habit, value = model.initial_state(batch, x.device)
-            actions_seq = x[:, :, :model._n_actions]
-            h0          = h_state.unsqueeze(0)
-            habit_hiddens, _ = model.habit_rnn_cell(actions_seq, h0)  # (batch, time, hidden)
+        # habit_out_linear is NOT called inside the loop so the hook fires
+        # only once (the bulk call below).
+        state = model.initial_state(batch, x.device)
+        h_hiddens = []
+        v_outputs = []
 
-            # Value stream still needs a step-by-step loop (custom Q-update).
-            v_outputs = []
-            for t in range(time - 1):
-                action = x[:, t, :model._n_actions]
-                reward = x[:, t, -1]
-                next_value, v_state = model._value_rnn(v_state, value, action, reward)
-                v_outputs.append(next_value)
-                value = next_value
+        for t in range(time - 1):
+            h_state, v_state, habit, value = state
+            action = x[:, t, :model._n_actions]
+            reward = x[:, t, -1]
 
-            features = habit_hiddens[:, :-1].contiguous().view(-1, model._hidden_size)
+            next_value, next_v_state = model._value_rnn(v_state, value, action, reward)
 
-        else:
-            # Slow path: manual loop for both streams.
-            # habit_out_linear is NOT called inside the loop so the hook fires
-            # only once (the bulk call below).
-            state = model.initial_state(batch, x.device)
-            h_hiddens = []
-            v_outputs = []
+            # Habit hidden state — replicate _habit_rnn but skip the output linear.
+            h_in = action
+            # same order as BiRNN._habit_rnn: [action, habit (o), state (s)]
+            if model._ho: h_in = torch.cat([h_in, habit],   dim=-1)
+            if model._hs: h_in = torch.cat([h_in, h_state], dim=-1)
+            next_h_state = torch.tanh(model.habit_rnn_linear(h_in))
 
-            for t in range(time - 1):
-                h_state, v_state, habit, value = state
-                action = x[:, t, :model._n_actions]
-                reward = x[:, t, -1]
+            h_hiddens.append(next_h_state)
+            v_outputs.append(next_value)
 
-                next_value, next_v_state = model._value_rnn(v_state, value, action, reward)
+            # habit placeholder for _ho feedback; habit_out_linear NOT called here
+            if model._ho:
+                # Must compute habit for the next step's feedback input
+                next_habit = model.habit_out_linear(next_h_state)
+            else:
+                next_habit = habit  # not used as input — safe placeholder
 
-                # Habit hidden state — replicate _habit_rnn but skip the output linear.
-                h_in = action
-                if model._hs: h_in = torch.cat([h_in, h_state], dim=-1)
-                if model._ho: h_in = torch.cat([h_in, habit],   dim=-1)
-                next_h_state = torch.tanh(model.habit_rnn_linear(h_in))
+            state = (next_h_state, next_v_state, next_habit, next_value)
 
-                h_hiddens.append(next_h_state)
-                v_outputs.append(next_value)
-
-                # habit placeholder for _ho feedback; habit_out_linear NOT called here
-                if model._ho:
-                    # Must compute habit for the next step's feedback input
-                    next_habit = model.habit_out_linear(next_h_state)
-                else:
-                    next_habit = habit  # not used as input — safe placeholder
-
-                state = (next_h_state, next_v_state, next_habit, next_value)
-
-            features = torch.stack(h_hiddens, dim=1).contiguous().view(-1, model._hidden_size)
+        features = torch.stack(h_hiddens, dim=1).contiguous().view(-1, model._hidden_size)
 
         # habit_out_linear called ONCE with 2D input — Laplace hooks here last
-        habit_logits  = model.habit_out_linear(features)                        # (N, n_actions)
-        value_offsets = torch.stack(v_outputs, dim=1).contiguous().view(-1, model._n_actions)
+        habit_logits  = model.habit_out_linear(features[keep])                  # (n_valid, n_actions)
+        value_offsets = torch.stack(v_outputs, dim=1).contiguous().view(-1, model._n_actions)[keep]
 
         # Pre-softmax combination. detach_value=True keeps Laplace's gradient
         # confined to the habit head (last-layer approximation); set False to
@@ -260,7 +279,7 @@ def laplace_ready(
     model: RNN | BiRNN,
     n_actions: int = 4,
     n_trials:  int = 150,
-    detach_value: bool = True,
+    detach_value: bool = False,
 ) -> SequenceModelWrapper:
     """Return a laplace-torch-compatible wrapper around a trained model.
 
@@ -337,7 +356,8 @@ def freeze_non_linear_parameters(module: nn.Module):
 
 def count_valid_samples(loader_or_dataset) -> int:
     """Total number of valid (non-missed) (block, timestep) predictions in a
-    SequenceDataset/DataLoader built by make_dataloader().
+    SequenceDataset/DataLoader built by make_dataloader() -- i.e. the total
+    len(y) over one pass of the loader, since missed targets are dropped.
 
     Why this matters: laplace-torch computes `N = len(train_loader.dataset)`
     and expects it in the SAME units as `M = len(y)` per batch -- see
@@ -381,7 +401,11 @@ def fit_kron_with_correct_N(laplace_obj, train_loader) -> None:
     laplace_obj.fit(train_loader)
     n_wrong   = len(train_loader.dataset)
     n_correct = count_valid_samples(train_loader)
-    laplace_obj.H = laplace_obj.H * (n_wrong / n_correct)
+    # laplace-torch puts 1/N only on the A (input) factor of 2-factor weight
+    # blocks; bias blocks [B] do not depend on N. Rescale A only (laplace's own
+    # helper), then re-decompose. Do NOT use `H * s`: it scales bias blocks too.
+    laplace_obj.H_facs = laplace_obj._rescale_factors(laplace_obj.H_facs, n_wrong / n_correct)
+    laplace_obj.H = laplace_obj.H_facs.decompose(damping=laplace_obj.damping)
 
 
 def make_dataloader(
@@ -402,7 +426,8 @@ def make_dataloader(
     Returns:
         DataLoader yielding (x, y) where:
             x : (batch, n_trials, n_actions+2)
-            y : (batch*(n_trials-1),)  — flattened target class indices
+            y : (n_valid,)  — flattened target class indices, missed targets
+                dropped (the same rows SequenceModelWrapper drops)
     """
     dataset = SequenceDataset(tensor, n_actions=n_actions)
 
@@ -410,7 +435,7 @@ def make_dataloader(
         xs, ys = zip(*batch)
         x = torch.stack(xs)              # (batch, n_trials, n_actions+2)
         y = torch.stack(ys).reshape(-1)  # (batch*(n_trials-1),)
-        return x, y
+        return x, y[valid_targets(x, n_actions)]
 
     return torch.utils.data.DataLoader(
         dataset,

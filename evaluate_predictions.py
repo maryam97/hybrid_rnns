@@ -36,6 +36,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
+from hybrid_rnns_pytorch.hyb_rnn_utilities import MAX_MISSED, load_osf_dataframe
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -46,7 +48,7 @@ def parse_args():
         description='Compare generated synthetic data to human behavioural data.')
     p.add_argument('--original',   type=str,
                    default='hybrid_rnns_pytorch/data/openSourceRawDataset.csv',
-                   help='Path to the original human dataset CSV.')
+                   help='Path to the original human dataset CSV (either OSF file).')
     p.add_argument('--generated',  type=str, nargs='+', required=True,
                    help='Path(s) to generated CSV files (glob patterns accepted).')
     p.add_argument('--label',      type=str, default=None,
@@ -64,12 +66,18 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def load_df(path: str, n_actions: int = 4, debug_subs: int | None = None) -> pd.DataFrame:
-    """Load and clean a dataset CSV. Drops missed trials (action < 0)."""
-    df = pd.read_csv(path)
+    """Load either OSF CSV or a generated CSV (rewards 0-1). Drops missed trials (action < 0).
+
+    Also drops blocks with > MAX_MISSED missed trials, i.e. keeps the paper's
+    4,134 blocks (a no-op for generated data, which has no missed trials).
+    """
+    df = load_osf_dataframe(path)
     if debug_subs is not None:
         keep = df['s_id'].unique()[:debug_subs]
         df   = df[df['s_id'].isin(keep)]
-    df = df[df['action'] >= 0].copy()
+    n_trials = df['trial_id'].nunique()
+    df = df[df['action'] >= 0]
+    df = df[df.groupby(['s_id', 'block'])['trial_id'].transform('size') >= n_trials - MAX_MISSED].copy()
     df['action'] = df['action'].astype(int)
     return df
 
@@ -88,6 +96,7 @@ def win_stay_lose_shift(df: pd.DataFrame) -> tuple[float, float]:
 
     Win  = reward > mean reward across the whole dataset.
     Stay = same action as the previous trial.
+    Pairs where either trial was missed (dropped by load_df) are skipped.
     """
     threshold = df['reward'].mean()
     ws, ls    = [], []
@@ -96,8 +105,9 @@ def win_stay_lose_shift(df: pd.DataFrame) -> tuple[float, float]:
         grp = grp.sort_values('trial_id')
         acts = grp['action'].values
         rews = grp['reward'].values
+        tids = grp['trial_id'].values
         for t in range(1, len(grp)):
-            if acts[t - 1] < 0 or acts[t] < 0:
+            if tids[t] != tids[t - 1] + 1:   # a missed trial lies in between
                 continue
             stayed = int(acts[t] == acts[t - 1])
             if rews[t - 1] > threshold:
@@ -164,7 +174,7 @@ def main():
     # ---- load human data ----
     df_hum = load_df(args.original, n_actions, debug_subs)
     print(f'Human data  : {df_hum["s_id"].nunique()} participants, '
-          f'{len(df_hum)} valid trials')
+          f'{df_hum.groupby(["s_id", "block"]).ngroups} blocks, {len(df_hum)} valid trials')
 
     # ---- load generated data ----
     gen_dfs = []

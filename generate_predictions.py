@@ -16,21 +16,25 @@ back into the model — and store it in the output CSV.  All other columns
 
 Usage
 -----
-    python generate_predictions.py --checkpoint birnn_marglik.pt --n-seeds 10
-    python generate_predictions.py --checkpoint birnn_marglik.pt --seeds 0 1 2 42 99
-    python generate_predictions.py --checkpoint rnn_trained.pt --model rnn --n-seeds 5
-    python generate_predictions.py --checkpoint birnn_marglik.pt --no-debug --n-seeds 20 --save-dir results/synthetic
+    python generate_predictions.py --checkpoint trained_models/birnn_hs=32_steps=1000000_seed=42_v2.pt --n-seeds 10
+    python generate_predictions.py --checkpoint trained_models/birnn_hs=32_steps=1000000_seed=42_v2.pt --seeds 0 1 2 42 99
+    python generate_predictions.py --checkpoint trained_models/rnn_hs=64_steps=1000000_seed=42_v2.pt --model rnn --n-seeds 5
+    python generate_predictions.py --checkpoint trained_models/birnn_hs=32_steps=1000000_seed=42_v2.pt --no-debug --n-seeds 20 --save-dir results/synthetic
+
+The model is built from the paper configs (get_birnn_config: Memory-ANN, hidden 32;
+get_rnn_config: vanilla RNN, hidden 64), i.e. the checkpoints run_training.py saves.
+Pass --hidden-size for a checkpoint trained with another hidden size.
 """
 
 import argparse
 import os
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from hybrid_rnns_pytorch.rnn_config import get_config
+from hybrid_rnns_pytorch.rnn_config import get_birnn_config, get_rnn_config
+from hybrid_rnns_pytorch.hyb_rnn_utilities import load_osf_dataframe
 from hybrid_rnns_pytorch.bi_rnn import BiRNN
 from hybrid_rnns_pytorch.rnn import RNN
 
@@ -46,8 +50,12 @@ def parse_args():
                    help='Path to saved model weights (.pt).')
     p.add_argument('--model',       choices=['rnn', 'birnn'], default='birnn',
                    help='Model architecture (must match checkpoint).')
+    p.add_argument('--hidden-size', type=int, default=None,
+                   help='Hidden units per RNN layer. Default: paper config '
+                        '(32 for birnn, 64 for rnn); set it to match the checkpoint.')
     p.add_argument('--dataset',     type=str,
-                   default='hybrid_rnns_pytorch/data/openSourceRawDataset.csv')
+                   default='hybrid_rnns_pytorch/data/openSourceRawDataset.csv',
+                   help='Either OSF CSV (rewards are rescaled to 0-1).')
     p.add_argument('--n-seeds',     type=int, default=10,
                    help='Number of synthetic datasets to generate.')
     p.add_argument('--first-seed',  type=int, default=0,
@@ -132,8 +140,10 @@ def main():
             list(range(args.first_seed, args.first_seed + args.n_seeds))
 
     # ---- config & model ----
-    config = get_config()
-    config.model_name = args.model
+    # Paper configs (Memory-ANN / vanilla RNN), as saved by run_training.py
+    config = get_birnn_config() if args.model == 'birnn' else get_rnn_config()
+    if args.hidden_size is not None:
+        config.network_params.hidden_size = args.hidden_size
     config.network_params.use_rnn_cell = False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -151,14 +161,17 @@ def main():
     n_actions   = config.network_params.n_actions
     payout_cols = [f'payout_{i + 1}' for i in range(n_actions)]
 
-    hum_dat = pd.read_csv(args.dataset)
+    hum_dat = load_osf_dataframe(args.dataset)   # payout_1..4 and reward on a 0-1 scale
     if not args.no_debug:
         hum_dat = hum_dat[hum_dat['s_id'].isin(hum_dat['s_id'].unique()[:20])]
         print(f'Debug mode : {hum_dat["s_id"].nunique()} participants')
 
     hum_dat  = hum_dat.sort_values(['s_id', 'block', 'trial_id']).reset_index(drop=True)
     n_trials = hum_dat['trial_id'].nunique()
-    n_blocks = len(hum_dat) // n_trials
+    sizes    = hum_dat.groupby(['s_id', 'block']).size()
+    if not (sizes == n_trials).all():   # the reshape below assumes equal-length blocks
+        raise ValueError(f'{int((sizes != n_trials).sum())} blocks do not have {n_trials} trials')
+    n_blocks = len(sizes)
 
     payouts = torch.tensor(
         hum_dat[payout_cols].values.reshape(n_blocks, n_trials, n_actions),

@@ -1,5 +1,6 @@
 """RNN — PyTorch port of hybrid_rnns_reward_learning/rnn.py."""
 
+import math
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -14,9 +15,9 @@ class RNN(nn.Module):
     Mirrors the Haiku RNN. Accepts options `s` (feed previous hidden state
     back as input) and `o` (feed previous output / 'gist' back as input).
 
-    When network_params.use_rnn_cell is True and neither s nor o is set,
-    unroll() uses a single nn.RNN call (no Python loop) instead of stepping
-    through the sequence one trial at a time.
+    When network_params.use_rnn_cell is True and neither s nor o is set, the
+    model has no recurrence, so unroll() applies the hidden layer to all time
+    steps at once instead of looping (same result).
     """
 
     def __init__(self, rl_params, network_params):
@@ -30,19 +31,19 @@ class RNN(nn.Module):
         self._hidden_size = network_params.hidden_size
         self._final_activation_fn = network_params.final_activation_fn
 
-        if self._use_rnn_cell and not self._o and not self._s:
-            # Fast path: nn.RNN processes the full sequence in one compiled call.
-            # Input is (action + reward) with no extra feedback concatenated.
-            self.rnn_cell = nn.RNN(
-                self._n_actions + 1, self._hidden_size,
-                batch_first=True, nonlinearity='tanh',
-            )
-        else:
-            # Original path: LazyLinear infers input size at first forward pass
-            # (handles variable input size from s/o feedback options).
-            self.rnn_linear = nn.LazyLinear(self._hidden_size)
-
+        in_dim = self._n_actions + 1                 # action one-hot + reward
+        if self._o:
+            in_dim += self._n_actions
+        if self._s:
+            in_dim += self._hidden_size
+        self.rnn_linear = nn.Linear(in_dim, self._hidden_size)
         self.output_linear = nn.Linear(self._hidden_size, self._n_actions)
+
+        # hk.Linear default init: truncated normal (+-2 std), std = 1/sqrt(fan_in); zero bias
+        for lin in (self.rnn_linear, self.output_linear):
+            std = 1.0 / math.sqrt(lin.in_features)
+            nn.init.trunc_normal_(lin.weight, std=std, a=-2 * std, b=2 * std)
+            nn.init.zeros_(lin.bias)
 
     # ------------------------------------------------------------------
     def forward(
@@ -82,21 +83,12 @@ class RNN(nn.Module):
         device     = input_seq.device
 
         if self._use_rnn_cell and not self._o and not self._s:
-            # ---- fast path: single nn.RNN call, no Python loop ----
-            if initial_state is None:
-                h0 = torch.zeros(1, batch_size, self._hidden_size, device=device)
-            else:
-                _, h_prev = initial_state
-                h0 = h_prev.unsqueeze(0)          # (1, batch, hidden)
-
-            hidden_seq, final_h = self.rnn_cell(input_seq, h0)
-            # hidden_seq: (batch, time, hidden),  final_h: (1, batch, hidden)
-
-            gist_seq     = self.output_linear(hidden_seq)        # (batch, time, n_actions)
+            # ---- fast path (s=o=False): no recurrence in the original model,
+            # so the hidden layer is applied to every time step at once.
+            hidden_seq   = torch.tanh(self.rnn_linear(input_seq))   # (batch, time, hidden)
+            gist_seq     = self.output_linear(hidden_seq)           # (batch, time, n_actions)
             action_probs = self._final_activation_fn(gist_seq)
-
-            final_state = (gist_seq[:, -1], final_h.squeeze(0))
-            return action_probs, final_state
+            return action_probs, (gist_seq[:, -1], hidden_seq[:, -1])
 
         else:
             # ---- original path: manual loop ----

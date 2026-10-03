@@ -5,56 +5,47 @@ Requires:
 
 Workflow
 --------
-1. Load data and split by participant (same as training).
-2. Train (or load) a model checkpoint.
+1. Load data on the paper split.
+2. Load a model checkpoint (or train one on the train split).
 3. Wrap with laplace_ready() so Laplace sees a standard (x -> logits) API.
-4. Fit Laplace on the training set.
-5. Optimise prior precision via marginal likelihood.
-6. Evaluate calibration on the test set.
+4. Fit Laplace on --fit-on: the blocks the checkpoint was trained on (default:
+   all 4,134 kept blocks, as for run_laplace_training.py checkpoints).
+5. Optimise the prior precision by marginal likelihood and report the evidence
+   (total, per block, per choice) -- the model-comparison quantity.
+6. Evaluate MAP and Laplace (GLM) predictive on the 413 test blocks with the
+   paper metric (in-sample when --fit-on all).
 
-Default: full-parameter Laplace (subset=all, hessian=full, CurvlinopsGGN).
-This covers ALL weights including BiRNN's bare nn.Parameters — a much better
-approximation than last-layer only. Post-hoc fitting is one shot (not per epoch),
-so even full Hessian is fast (seconds to minutes).
-
-subset='all' requires the model wrapper's value stream to be un-detached
-(detach_value=False, wired below) -- otherwise value_rnn_linear/value_out_linear
-and BiRNN's bare scalar nn.Parameters get silently zeroed-out curvature, since
-Curvlinops' Jacobian-based backends don't error on unused parameters the way
-a plain autograd.grad() call would. See laplace_compat.py for details.
-
-Fitting Kron/full over the whole model is NOT the slow part (~15s, <1GB even
-over the full 3,300-block training set, either backend). The evaluation step
-uses pred_type='nn' (MC weight samples + plain forward passes), not 'glm':
-'glm' computes an exact per-sample Jacobian-based predictive covariance,
-and our wrapper flattens every (block, timestep) pair into one giant sample
-dimension (batch_size=32 blocks * ~149 timesteps =~ 4,768 samples/batch), so
-'glm' measured ~5-6 minutes and several GB of RAM for a SINGLE test batch.
-'nn' measured 0.3s for the same batch -- use --n-samples to trade accuracy
-of the MC estimate for speed.
+Default: exact full GGN over all weights (subset=all, hessian=full, FuncGGN).
+Use this for the reported evidence: Kron is biased for the weight-shared
+recurrent layers (~2k nats off for the BiRNN). It costs roughly 1 s per block.
+Bare nn.Parameters (BiRNN's init/forget scalars) are in the full posterior but
+excluded from Kron (kept at their MAP values).
 
 Usage
 -----
-    python run_laplace.py --checkpoint model.pt --no-debug        # full, birnn
-    python run_laplace.py --checkpoint model.pt --model rnn       # full, rnn
-    python run_laplace.py --checkpoint model.pt --hessian kron    # cheaper, all Linear layers
-    python run_laplace.py --checkpoint model.pt --subset last_layer  # fast, poor approx
+    python run_laplace.py --checkpoint trained_models/<marglik run>.pt                     # birnn, all data
+    python run_laplace.py --checkpoint trained_models/<marglik run>.pt --model rnn
+    python run_laplace.py --checkpoint trained_models/birnn_hs=32_steps=1000000_seed=42_v2.pt --fit-on train
+    python run_laplace.py --checkpoint ... --hessian kron                                  # fast, approximate
 """
 
 import argparse
+import json
+import os
 from contextlib import nullcontext
 import torch
-import pandas as pd
 
-from hybrid_rnns_pytorch.rnn_config   import get_config
+from hybrid_rnns_pytorch.rnn_config   import get_rnn_config, get_birnn_config
 from hybrid_rnns_pytorch.fit_hyb_rnn  import train
 from hybrid_rnns_pytorch import hyb_rnn_utilities
 from hybrid_rnns_pytorch.laplace_compat import (
     laplace_ready, make_dataloader, freeze_non_linear_parameters,
+    rows_to_blocks, count_valid_samples, fit_kron_with_correct_N, FuncGGN,
 )
 from hybrid_rnns_pytorch.bi_rnn import BiRNN
 from hybrid_rnns_pytorch.rnn    import RNN
-from laplace.curvature import AsdlGGN, CurvlinopsGGN
+from laplace import Laplace
+from laplace.curvature import AsdlGGN
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +53,11 @@ from laplace.curvature import AsdlGGN, CurvlinopsGGN
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Last-layer Laplace on a trained hybrid RNN.')
+    p = argparse.ArgumentParser(description='Post-hoc Laplace approximation on a trained hybrid RNN.')
     p.add_argument('--model',       choices=['rnn', 'birnn'], default='birnn')
+    p.add_argument('--hidden-size', type=int, default=None,
+                   help='Hidden units per RNN layer. Default: paper config '
+                        '(32 for birnn, 64 for rnn); set it to match a checkpoint.')
     p.add_argument('--no-debug',    action='store_true',
                    help='Run full training instead of quick debug training.')
     p.add_argument('--checkpoint',  type=str, default=None,
@@ -71,9 +65,13 @@ def parse_args():
                         'If given, skip training and load weights directly.')
     p.add_argument('--dataset',     type=str,
                    default='hybrid_rnns_pytorch/data/openSourceRawDataset.csv')
+    p.add_argument('--fit-on',      choices=['train', 'trainvalid', 'all'], default='all',
+                   help='Blocks the posterior is fitted on (default: all 4,134). MUST be the '
+                        'blocks the checkpoint was trained on: run_laplace_training.py -> its '
+                        '--fit-on (default all); run_training.py -> train.')
     p.add_argument('--batch-size',  type=int, default=32,
                    help='Batch size for Laplace fit DataLoader.')
-    p.add_argument('--n-samples',   type=int, default=50,
+    p.add_argument('--n-samples',   type=int, default=200,
                    help='Posterior samples for predictive accuracy estimate.')
     p.add_argument('--subset',      choices=['last_layer', 'all'], default='all',
                    help='Which weights to put under the Laplace posterior. '
@@ -82,11 +80,9 @@ def parse_args():
                         '"last_layer" is fast but a poor approximation.')
     p.add_argument('--hessian',     choices=['kron', 'full', 'diag'], default=None,
                    help='Hessian structure. Default: "kron" for last_layer, '
-                        '"full" for all. With subset=all, "kron" (all Linear '
-                        'layers, AsdlGGN) is cheaper than "full" but '
-                        'leaves BiRNN\'s bare nn.Parameters to the prior only; '
-                        '"full" is the only structure that gives them real '
-                        'curvature.')
+                        '"full" (exact GGN) for all. "kron" (all Linear layers, '
+                        'AsdlGGN) is much faster but its evidence is biased for the '
+                        'recurrent layers and it leaves out BiRNN\'s bare scalars.')
     return p.parse_args()
 
 
@@ -100,15 +96,6 @@ def _build_model(config):
     return RNN(config.rnn_rl_params, config.network_params)
 
 
-def accuracy_from_probs(probs: torch.Tensor, y: torch.Tensor) -> float:
-    """Geometric-mean probability assigned to each correct class.
-
-    Matches the paper formula: acc = exp(-mean NLL per valid trial).
-    """
-    correct_probs = probs[torch.arange(len(y)), y].clamp(min=1e-8)
-    return correct_probs.log().mean().exp().item()
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -117,29 +104,30 @@ def main():
     args = parse_args()
 
     # ---------------------------------------------------------------- config
-    config             = get_config()
-    config.model_name  = args.model
+    # Paper configs (Memory-ANN / vanilla RNN), so run_training.py checkpoints
+    # load. debug=False -> 1M steps and the paper batch size (Table 1).
+    get_cfg = get_birnn_config if args.model == 'birnn' else get_rnn_config
+    config  = get_cfg(debug=not args.no_debug)
     config.dataset_path = args.dataset
-    if args.no_debug:
-        config.debug             = False
-        config.n_training_steps  = int(1e6)
-        config.batch_size        = 32
+    if args.hidden_size is not None:
+        config.network_params.hidden_size = args.hidden_size
+    n_actions = config.network_params.n_actions
 
     # resolve subset / hessian structure / backend
     subset = args.subset
+    if subset == 'last_layer' and args.model == 'birnn':
+        # laplace-torch's last-layer predictive calls last_layer(feats) directly, which drops
+        # the BiRNN value offset (reference weights: Laplace NLL 79.5 vs MAP 61.6 per block).
+        raise SystemExit('--subset last_layer is wrong for birnn (drops the value stream); use --subset all')
+    if args.checkpoint is None and args.fit_on != 'train':
+        # Without a checkpoint the MAP is trained by fit_hyb_rnn.train on the train split;
+        # a posterior is only valid around the MAP of the same data.
+        raise SystemExit('Without --checkpoint the model is trained on the train split: '
+                         'pass --fit-on train (or a checkpoint trained on the other blocks).')
     hessian = args.hessian or ('kron' if subset == 'last_layer' else 'full')
-    # AsdlGGN works fine for subset='all' + hessian='kron' -- including when
-    # habit_rnn_linear/value_rnn_linear are called repeatedly per forward pass
-    # (149x, once per timestep) -- PROVIDED the wrapper's value stream is not
-    # detached (detach_value=False, wired below): ASDL's hooks only populate
-    # a module's `.fisher` stat if it actually receives a backward gradient,
-    # so a detached value stream previously looked like a weight-sharing
-    # crash (`TypeError: 'float' * NoneType`) but was really this. AsdlGGN is
-    # ~2.5x faster than CurvlinopsGGN here. Bare nn.Parameters still can't be
-    # Kron-factored by either backend, so they're frozen out of the fit below
-    # and left to the prior (see freeze_non_linear_parameters). Only 'full'
-    # (no Kron structure) needs CurvlinopsGGN.
-    backend_cls = CurvlinopsGGN if hessian == 'full' else AsdlGGN
+    # Kron: AsdlGGN (the value stream must stay in the graph and bare scalars are
+    # frozen out, see laplace_compat.py). Full: exact GGN via torch.func.
+    backend_cls = FuncGGN if hessian == 'full' else AsdlGGN
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device          : {device}')
@@ -147,8 +135,9 @@ def main():
 
     # ------------------------------------------------------------ data split
     print(f'Loading data from {config.dataset_path}')
-    hum_dat  = pd.read_csv(config.dataset_path)
-    tensors  = hyb_rnn_utilities.format_data_for_model_training(hum_dat)
+    hum_dat  = hyb_rnn_utilities.load_osf_dataframe(config.dataset_path)   # rewards 0-1
+    tensors  = hyb_rnn_utilities.format_data_for_model_training(
+        hum_dat, n_actions=n_actions, split_file=config.split_path)
     train_dat = tensors['train_dat'].to(device)
     valid_dat = tensors['valid_dat'].to(device)
     test_dat  = tensors['test_dat'].to(device)
@@ -167,32 +156,25 @@ def main():
     print('Model ready.')
 
     # ----------------------------------------------------------- wrap model
-    try:
-        from laplace import Laplace
-    except ImportError:
-        raise ImportError(
-            "laplace-torch is not installed. Run:\n"
-            "    pip install laplace-torch"
-        )
-
-    # detach_value=False for subset='all': the value stream (value_rnn_linear,
-    # value_out_linear, and any bare init/forget scalars) must stay in the
-    # gradient graph or it silently gets zero curvature (see laplace_compat.py).
-    wrapped = laplace_ready(model, n_actions=config.network_params.n_actions,
-                             detach_value=(subset != 'all'))
+    # The value stream must stay in the gradient graph (see laplace_compat.py).
+    wrapped = laplace_ready(model, n_actions=n_actions, detach_value=False)
 
     # --------------------------------------------------- build data loaders
+    fit_dat = {'train': train_dat, 'trainvalid': torch.cat([train_dat, valid_dat]),
+               'all': torch.cat([train_dat, valid_dat, test_dat])}[args.fit_on]
+    print(f'Fitting posterior on {args.fit_on} ({len(fit_dat)} blocks); test metrics are '
+          f'{"IN-SAMPLE" if args.fit_on == "all" else "held-out"}')
     train_loader = make_dataloader(
-        train_dat,
-        n_actions  = config.network_params.n_actions,
-        batch_size = args.batch_size,
+        fit_dat,
+        n_actions  = n_actions,
+        batch_size = 4 if hessian == 'full' else args.batch_size,
         shuffle    = True,
     )
     test_loader = make_dataloader(
         test_dat,
-        n_actions  = config.network_params.n_actions,
-        batch_size = args.batch_size,
-        shuffle    = False,
+        n_actions  = n_actions,
+        batch_size = 4,           # GLM predictive: Jacobians per batch, keep batches small
+        shuffle    = False,   # keep test_dat block order for the per-block metrics
     )
 
     # --------------------------------------------------------------- Laplace
@@ -214,63 +196,81 @@ def main():
             hessian_structure = hessian,
             backend           = backend_cls,
         )
-        la.fit(train_loader)
+        if hessian == 'kron':
+            fit_kron_with_correct_N(la, train_loader)   # N = choices, not blocks
+        else:
+            la.fit(train_loader)
         print('Laplace fit complete.')
 
         # ------------------------------------------ optimise prior precision
         print('Optimising prior precision...')
-        la.optimize_prior_precision(
-            method       = 'marglik',
-            pred_type    = 'glm',
-            link_approx  = 'probit',
-        )
+        la.optimize_prior_precision(method='marglik')
         marglik = la.log_marginal_likelihood(la.prior_precision).item()
     print(f'Optimised prior precision: {la.prior_precision.item():.4f}')
-    print(f'Log marginal likelihood  : {marglik:.4f}')
+    n_fit = count_valid_samples(train_loader)
+    print(f'Log marginal likelihood  : {marglik:.4f}  ({len(fit_dat)} blocks, {n_fit} choices: '
+          f'{marglik / len(fit_dat):.3f}/block, {marglik / n_fit:.5f}/choice)')
 
     # ---------------------------------------------------------- evaluate
     print('\nEvaluating on test set...')
-    all_probs = []
-    all_y     = []
+    nll_blocks = {'map': [], 'laplace': []}
+    n_correct = {'map': 0, 'laplace': 0}
 
-    # pred_type='nn' (MC-sample weights from the Laplace posterior, then a
-    # plain forward pass per sample) instead of 'glm'. 'glm' computes an
-    # exact per-sample Jacobian-based predictive covariance, which is
-    # O(n_samples_in_batch * n_params) -- and our wrapper flattens every
-    # (block, timestep) pair into one giant "sample" dimension (batch_size=32
-    # blocks * ~149 timesteps =~ 4,768 samples/batch), so 'glm' took ~5-6
-    # minutes and several GB of RAM for a SINGLE test batch. 'nn' only
-    # samples args.n_samples weight vectors and does ordinary forward
-    # passes: ~1000x cheaper (measured 0.3s vs 336s per batch) and this cost
-    # is independent of which curvature backend (ASDL/Curvlinops) fit the
-    # Kron structure -- fitting itself was never the bottleneck.
+    # GLM predictive on 4-block batches (~0.7 s/block). Wrapper outputs are rows for non-missed targets only (y_batch is filtered
+    # the same way); rows_to_blocks puts them back on the (B, T-1, A) grid.
     with torch.no_grad():
         for x_batch, y_batch in test_loader:
-            x_batch = x_batch.to(device)
-            # Posterior predictive (mean over Laplace posterior)
-            probs = la(x_batch, pred_type='nn', link_approx='mc',
-                       n_samples=args.n_samples)
-            all_probs.append(probs.cpu())
-            all_y.append(y_batch.cpu())
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            batch_probs = {
+                # MAP model (plain softmax); computed first, before la() samples weights
+                'map':     wrapped.predict_proba(x_batch),
+                # Posterior predictive (mean over Laplace posterior)
+                # GLM (linearised) predictive: the one consistent with a GGN posterior.
+                # pred_type='nn' samples weights through the 149-step recurrence and is far
+                # worse than MAP; link_approx='probit' ignores the softmax-shift correlation.
+                'laplace': la(x_batch, pred_type='glm', link_approx='mc',
+                              n_samples=args.n_samples),
+            }
+            for k, probs in batch_probs.items():
+                block_probs = rows_to_blocks(probs, x_batch, n_actions)
+                nll_blocks[k].append(hyb_rnn_utilities.block_nll(block_probs, x_batch, n_actions).cpu())
+                n_correct[k] += (probs.argmax(dim=-1) == y_batch).sum().item()
 
-    all_probs = torch.cat(all_probs, dim=0)   # (N_total, n_actions)
-    all_y     = torch.cat(all_y,     dim=0)   # (N_total,)
-
-    # MAP accuracy (argmax)
-    map_acc = (all_probs.argmax(dim=-1) == all_y).float().mean().item()
-    # Paper-style accuracy (geometric mean probability assigned to correct action)
-    paper_acc = accuracy_from_probs(all_probs, all_y)
-
-    print(f'\n=== Laplace test-set results ===')
-    print(f'Argmax accuracy   : {map_acc * 100:.2f}%')
-    print(f'Paper-style acc   : {paper_acc * 100:.2f}%  '
-          f'(paper target ~68.3% for BiRNN)')
+    n_valid = count_valid_samples(test_loader)
+    print(f'\n=== Test-set results ({len(test_dat)} blocks, '
+          f'{"IN-SAMPLE" if args.fit_on == "all" else "held-out"}) ===')
+    print('acc_paper = mean over blocks of exp(-NLL_block/150) (paper metric); '
+          'acc_pooled = exp(-total NLL / valid trials)')
+    test_metrics = {}
+    for k, name in (('map', 'MAP'), ('laplace', f'Laplace ({args.n_samples} MC samples)')):
+        m = hyb_rnn_utilities.accuracy_metrics(torch.cat(nll_blocks[k]), test_dat.cpu(), n_actions)
+        test_metrics[k] = {**m, 'argmax_acc': n_correct[k] / n_valid}
+        print(f"{name:24s}: NLL/block {m['nll_per_block']:.2f} | acc_paper {m['acc_paper'] * 100:.2f}% "
+              f"| acc_pooled {m['acc_pooled'] * 100:.2f}% | argmax {n_correct[k] / n_valid * 100:.2f}%")
+    if args.fit_on != 'all' and config.model_name == 'birnn' and config.network_params.hidden_size == 32:
+        print('Paper Memory-ANN: NLL/block 61.3, acc 68.3%')
     print(f'Prior precision   : {la.prior_precision.item():.4f}')
 
-    # ------------------------------------------ optional: save checkpoint
-    save_path = f'{args.model}_trained.pt'
-    torch.save(model.state_dict(), save_path)
-    print(f'\nModel weights saved to {save_path}')
+    stem = (os.path.splitext(os.path.basename(args.checkpoint))[0] if args.checkpoint
+            else f'{args.model}_hs={config.network_params.hidden_size}')
+    tag = f'{stem}_posthoc_fit={args.fit_on}_{hessian}'
+    results = {
+        'checkpoint': args.checkpoint, 'model': args.model,
+        'hidden_size': config.network_params.hidden_size,
+        'subset': subset, 'hessian': hessian, 'fit_on': args.fit_on,
+        'n_fit_blocks': len(fit_dat), 'n_fit_choices': n_fit,
+        'log_marglik': marglik, 'log_marglik_per_block': marglik / len(fit_dat),
+        'log_marglik_per_choice': marglik / n_fit,
+        'prior_precision': la.prior_precision.tolist(),
+        'test_held_out': args.fit_on != 'all',
+        # v2: acc_paper = mean over blocks of exp(-NLL/150); acc_pooled = old formula
+        'metric_version': 2,
+        'test_map': test_metrics['map'], 'test_laplace': test_metrics['laplace'],
+    }
+    os.makedirs('results', exist_ok=True)
+    with open(f'results/{tag}.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f'Results saved to results/{tag}.json')
 
     return la, model
 
